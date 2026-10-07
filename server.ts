@@ -1,239 +1,214 @@
-// ============================================================
-// F210 Auth Server v2.4.1
-// 使用方法：只改最下面"配置区"的3个值，其余不要动
-// 部署：git push 后 Deno Deploy 自动部署
-// ============================================================
+// server.ts - F210 Auth Server (Deno Deploy)
+// 部署: deno deploy --project f210-auth --entrypoint server.ts
 
-// ==================== 配置区（只改这里） ====================
-const DLL_HASH_WHITELIST: string[] = [
-    "5A8DF37F",          // ← 改成你 DLL 的 CRC32
-    // 可以填多个，每行一个，用引号包住，逗号结尾
-    // 调试期留空数组 [] 表示不校验
-];
+// ============ 配置（从环境变量读取） ============
 
-const ADMIN_SECRET = "xK9#mP2$vL7@qW3!nR5&jY8";  // ← 改成你自己的密码
-
-const MAX_TRANSFER_COUNT = 3;       // 最大换机次数，不用改
-const TRANSFER_COOLDOWN_DAYS = 7;   // 换机冷却天数，不用改
-// ============================================================
-
-
-
-// ==================== 以下全部不用改 ====================
-
-const kv = await Deno.openKv();
-
-// ---------- 工具函数 ----------
-function json(body: unknown, status = 200): Response {
-    return new Response(JSON.stringify(body), {
-        status,
-        headers: { "Content-Type": "application/json" },
-    });
+interface AuthEntry {
+  hwid: string;
+  expires_at?: number;       // Unix timestamp, 可选
+  note?: string;             // 备注
+  enabled: boolean;
 }
 
-function adminOk(req: Request): boolean {
-    const auth = req.headers.get("authorization");
-    return auth === `Bearer ${ADMIN_SECRET}`;
-}
+// HWID 授权表（环境变量 JSON 或硬编码）
+function load_hwid_table(): Map<string, AuthEntry> {
+  const table = new Map<string, AuthEntry>();
 
-// ---------- /license/check ----------
-async function checkLicense(req: Request): Promise<Response> {
-    let body: any;
-    try { body = await req.json(); } catch { return json({ error: "bad json" }, 400); }
-
-    const fp = body?.fp;
-    const device_code = body?.device_code;
-    const dll_hash = body?.dll_hash;
-
-    if (!fp) return json({ error: "missing fp" }, 400);
-
-    // dll_hash 校验
-    if (DLL_HASH_WHITELIST.length > 0 && dll_hash) {
-        if (!DLL_HASH_WHITELIST.includes(dll_hash)) {
-            return json({ status: "rejected", reason: "invalid_dll" }, 403);
-        }
+  // 方式1: 环境变量 HWID_TABLE (JSON 字符串)
+  const envTable = Deno.env.get("HWID_TABLE");
+  if (envTable) {
+    try {
+      const parsed = JSON.parse(envTable) as Record<string, Omit<AuthEntry, "hwid">>;
+      for (const [hwid, entry] of Object.entries(parsed)) {
+        table.set(hwid.toUpperCase(), { hwid: hwid.toUpperCase(), ...entry, enabled: entry.enabled ?? true });
+      }
+    } catch (e) {
+      console.error("Failed to parse HWID_TABLE:", e);
     }
+  }
 
-    const devKey = ["device", fp];
-    const existing = await kv.get(devKey);
+  // 方式2: 硬编码（开发/应急用，生产建议全走环境变量）
+  // table.set("DE7864D2C1664E39", { hwid: "DE7864D2C1664E39", enabled: true, note: "dev-machine-1" });
 
-    if (existing.value) {
-        const dev = existing.value as any;
-        if (dev.status === "banned") return json({ status: "banned" }, 403);
-        if (dev.status === "active") {
-            await kv.set(devKey, { ...dev, last_seen_at: Date.now() });
-            return json({ status: "ok", fp, device_code: dev.device_code ?? null });
-        }
-        return json({ status: "not_authorized", fp, device_code: dev.device_code ?? null });
-    }
-
-    // 新设备，原子写入防并发
-    const newDev: any = {
-        fp,
-        device_code: device_code ?? null,
-        status: "initializing",
-        created_at: Date.now(),
-        last_seen_at: Date.now(),
-        hwid_history: [fp],
-        transfer_count: 0,
-        note: "",
-        contact: "",
-    };
-
-    const atom = kv.atomic().check({ key: devKey, versionstamp: null }).set(devKey, newDev);
-    if (device_code) atom.set(["device_code", device_code], fp);
-    await atom.commit();
-
-    return json({ status: "not_authorized", fp, device_code });
+  return table;
 }
 
-// ---------- 管理接口 ----------
-async function adminPending(req: Request): Promise<Response> {
-    if (!adminOk(req)) return json({ error: "unauthorized" }, 401);
-    const url = new URL(req.url);
-    const code = url.searchParams.get("code");
+// config_hash 白名单（防止 DLL 被篡改）
+const CONFIG_HASH_ALLOWLIST = new Set(
+  (Deno.env.get("CONFIG_HASH_ALLOWLIST") ?? "")
+    .split(",")
+    .map(s => s.trim().toUpperCase())
+    .filter(Boolean)
+);
 
-    if (code) {
-        const fpEntry = await kv.get(["device_code", code]);
-        if (!fpEntry.value) return json({ error: "not found" }, 404);
-        const dev = await kv.get(["device", fpEntry.value as string]);
-        return json({ device_code: code, fp: fpEntry.value, device: dev.value });
-    }
+// 允许的版本列表
+const ALLOWED_VERSIONS = new Set(
+  (Deno.env.get("ALLOWED_VERSIONS") ?? "2.1.0")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+);
 
-    const list: any[] = [];
-    for await (const e of kv.list({ prefix: ["device"] })) {
-        const d = e.value as any;
-        if (d.status === "initializing" || d.status === "not_authorized") list.push(d);
-    }
-    return json({ count: list.length, devices: list });
+// ============ 响应工具 ============
+
+function json_response(obj: unknown, status = 200): Response {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    },
+  });
 }
 
-async function adminActivate(req: Request): Promise<Response> {
-    if (!adminOk(req)) return json({ error: "unauthorized" }, 401);
-    let body: any;
-    try { body = await req.json(); } catch { return json({ error: "bad json" }, 400); }
-
-    let fp = body?.fp;
-    const code = body?.device_code;
-
-    if (!fp && code) {
-        const e = await kv.get(["device_code", code]);
-        if (!e.value) return json({ error: "device_code not found" }, 404);
-        fp = e.value as string;
-    }
-    if (!fp) return json({ error: "missing fp" }, 400);
-
-    const devKey = ["device", fp];
-    const existing = await kv.get(devKey);
-    if (!existing.value) return json({ error: "device not found" }, 404);
-
-    const dev = existing.value as any;
-    await kv.set(devKey, {
-        ...dev,
-        status: "active",
-        activated_at: Date.now(),
-        expires_at: body?.expires_at ?? null,
-        note: body?.note ?? "",
-        contact: body?.contact ?? "",
-    });
-
-    return json({ status: "activated", fp, device_code: dev.device_code ?? null });
+function cors_preflight(): Response {
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    },
+  });
 }
 
-async function adminRevoke(req: Request): Promise<Response> {
-    if (!adminOk(req)) return json({ error: "unauthorized" }, 401);
-    let body: any;
-    try { body = await req.json(); } catch { return json({ error: "bad json" }, 400); }
-    const fp = body?.fp;
-    if (!fp) return json({ error: "missing fp" }, 400);
+// ============ 主服务 ============
 
-    const devKey = ["device", fp];
-    const existing = await kv.get(devKey);
-    if (!existing.value) return json({ error: "not found" }, 404);
+const HWID_TABLE = load_hwid_table();
 
-    const dev = existing.value as any;
-    await kv.set(devKey, { ...dev, status: "banned", banned_at: Date.now(), ban_reason: "revoked" });
-    return json({ status: "revoked", fp });
-}
-
-async function adminList(req: Request): Promise<Response> {
-    if (!adminOk(req)) return json({ error: "unauthorized" }, 401);
-    const list: any[] = [];
-    for await (const e of kv.list({ prefix: ["device"] })) list.push(e.value);
-    return json({ count: list.length, devices: list });
-}
-
-async function adminReplace(req: Request): Promise<Response> {
-    if (!adminOk(req)) return json({ error: "unauthorized" }, 401);
-    let body: any;
-    try { body = await req.json(); } catch { return json({ error: "bad json" }, 400); }
-
-    const old_fp = body?.old_fp;
-    const new_fp = body?.new_fp;
-    if (!old_fp || !new_fp) return json({ error: "missing old_fp or new_fp" }, 400);
-
-    const oldKey = ["device", old_fp];
-    const oldEntry = await kv.get(oldKey);
-    if (!oldEntry.value) return json({ error: "old device not found" }, 404);
-
-    const oldDev = oldEntry.value as any;
-    if ((oldDev.transfer_count ?? 0) >= MAX_TRANSFER_COUNT) {
-        return json({ error: "max transfer exceeded" }, 403);
-    }
-
-    const now = Date.now();
-    await kv.atomic()
-        .set(oldKey, { ...oldDev, status: "banned", banned_at: now, ban_reason: "transferred" })
-        .set(["device", new_fp], {
-            fp: new_fp,
-            device_code: oldDev.device_code,
-            status: "active",
-            activated_at: now,
-            expires_at: oldDev.expires_at,
-            note: oldDev.note,
-            contact: oldDev.contact,
-            hwid_history: [new_fp],
-            transfer_count: 0,
-            created_at: now,
-            last_seen_at: now,
-        })
-        .commit();
-
-    return json({ status: "replaced", old_fp, new_fp });
-}
-
-// ==================== 启动入口（不要改这里） ====================
-console.log("F210 Auth Server v2.4.1");
-console.log("Listening on http://0.0.0.0:8000/");
+console.log(`[F210 Auth] Loaded ${HWID_TABLE.size} HWID entries`);
+console.log(`[F210 Auth] Config hash allowlist: ${CONFIG_HASH_ALLOWLIST.size} entries`);
+console.log(`[F210 Auth] Allowed versions: ${[...ALLOWED_VERSIONS].join(", ")}`);
 
 Deno.serve(async (req: Request) => {
-    const url = new URL(req.url);
-    const path = url.pathname;
+  const url = new URL(req.url);
+  const method = req.method;
 
-    // CORS 预检
-    if (req.method === "OPTIONS") {
-        return new Response(null, {
-            headers: {
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, Authorization",
-            },
-        });
-    }
+  // CORS preflight
+  if (method === "OPTIONS") {
+    return cors_preflight();
+  }
 
+  // ============ POST /license/check ============
+  if (url.pathname === "/license/check" && method === "POST") {
+    let body: any = {};
     try {
-        if (path === "/license/check" && req.method === "POST") {
-            return await checkLicense(req);
-        }
-        if (path === "/admin/pending") return await adminPending(req);
-        if (path === "/admin/activate" && req.method === "POST") return await adminActivate(req);
-        if (path === "/admin/replace" && req.method === "POST") return await adminReplace(req);
-        if (path === "/admin/revoke" && req.method === "POST") return await adminRevoke(req);
-        if (path === "/admin/list") return await adminList(req);
-
-        return json({ error: "not found", path }, 404);
-    } catch (e: any) {
-        console.error("Unhandled error:", e);
-        return json({ error: "internal", detail: e.message }, 500);
+      body = await req.json();
+    } catch {
+      return json_response({ error: "invalid json" }, 400);
     }
+
+    const fp = String(body?.fp ?? "").trim().toUpperCase();
+    const hwid = String(body?.hwid ?? "").trim().toUpperCase();
+    const config_hash = String(body?.config_hash ?? "").trim().toUpperCase();
+    const dll_crc = String(body?.dll_crc ?? "").trim().toUpperCase();
+    const version = String(body?.version ?? "").trim();
+    const device_code = String(body?.device_code ?? "").trim();
+
+    // 基本参数校验
+    if (!fp || !hwid) {
+      return json_response({ error: "missing fp/hwid", status: "rejected" }, 400);
+    }
+
+    // 版本检查（宽松：不在列表里只告警不拒绝）
+    const version_ok = !version || ALLOWED_VERSIONS.has(version);
+    if (!version_ok) {
+      console.log(`[WARN] Unknown version: ${version} from HWID=${hwid}`);
+    }
+
+    // ========== 授权判断 ==========
+
+    let authorized = false;
+    let auth_method = "none";
+    let auth_note = "";
+
+    // 优先级1: HWID 授权表
+    const hwid_entry = HWID_TABLE.get(hwid);
+    if (hwid_entry && hwid_entry.enabled) {
+      // 检查过期
+      if (hwid_entry.expires_at && Date.now() > hwid_entry.expires_at) {
+        auth_note = "expired";
+        console.log(`[DENY] HWID ${hwid} expired at ${hwid_entry.expires_at}`);
+      } else {
+        authorized = true;
+        auth_method = "hwid";
+        auth_note = hwid_entry.note ?? "authorized";
+        console.log(`[AUTH] HWID ${hwid} authorized via HWID table (${auth_note})`);
+      }
+    }
+
+    // 优先级2: config_hash 辅助校验（HWID不在表但config_hash对 → 也授权，标记辅助）
+    if (!authorized && config_hash && CONFIG_HASH_ALLOWLIST.has(config_hash)) {
+      authorized = true;
+      auth_method = "config_hash";
+      auth_note = "fallback to config hash";
+      console.log(`[AUTH] HWID ${hwid} authorized via config_hash ${config_hash}`);
+    }
+
+    // 优先级3: 都失败 → 拒绝
+    if (!authorized) {
+      console.log(`[DENY] HWID ${hwid} rejected (not in table, config_hash=${config_hash || "none"})`);
+      return json_response({
+        status: "rejected",
+        reason: auth_note || "hwid_not_authorized",
+        hwid,
+        config_hash: config_hash || null,
+        suggestion: "Contact admin to authorize this device",
+      }, 403);
+    }
+
+    // ========== 授权成功 ==========
+
+    // 记录 dll_crc 到日志（用于后续分析）
+    if (dll_crc) {
+      console.log(`[INFO] Authorized device HWID=${hwid} dll_crc=${dll_crc} version=${version}`);
+    }
+
+    return json_response({
+      status: "ok",
+      authorized: true,
+      auth_method,
+      note: auth_note,
+      fp,
+      hwid,
+      version: version || null,
+      config_hash: config_hash || null,
+      dll_crc: dll_crc || null,
+      device_code: device_code || null,
+      server_time: Date.now(),
+    }, 200);
+  }
+
+  // ============ GET /admin/pending ============
+  if (url.pathname === "/admin/pending" && method === "GET") {
+    const auth_header = req.headers.get("Authorization");
+    const admin_key = Deno.env.get("ADMIN_KEY");
+    if (admin_key && auth_header !== `Bearer ${admin_key}`) {
+      return json_response({ error: "unauthorized" }, 401);
+    }
+    // 这里可以返回待授权列表（需要持久化存储，如 Deno KV）
+    return json_response({
+      message: "pending list (not implemented, use HWID_TABLE env var)",
+      hwid_table_size: HWID_TABLE.size,
+      config_hash_allowlist_size: CONFIG_HASH_ALLOWLIST.size,
+    });
+  }
+
+  // ============ GET /health ============
+  if (url.pathname === "/health" && method === "GET") {
+    return json_response({
+      status: "healthy",
+      version: "2.1.0",
+      hwid_count: HWID_TABLE.size,
+      uptime: Date.now(),
+    });
+  }
+
+  // ============ 404 ============
+  return json_response({
+    error: "not found",
+    path: url.pathname,
+  }, 404);
 });
