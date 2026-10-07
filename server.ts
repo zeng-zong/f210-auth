@@ -396,7 +396,7 @@ async function handleList(req: Request): Promise<Response> {
 }
 
 /* ==================== 路由 ==================== */
-serve(async (req: Request) => {
+Deno.serve(async (req: Request) => {
   const url = new URL(req.url);
   const path = url.pathname;
   const method = req.method;
