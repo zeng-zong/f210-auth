@@ -1,58 +1,56 @@
-// server.ts — F210 Auth Server v2.0
-// Deno Deploy 入口文件
+// ============================================================
+// F210 Auth Server v2.4.1
+// 使用方法：只改最下面"配置区"的3个值，其余不要动
+// 部署：git push 后 Deno Deploy 自动部署
+// ============================================================
 
-// ==================== 配置 ====================
-const VALID_DLL_HASHES = new Set([
-    "5A8DF37F" // 填入你 DLL 的 CRC32，如 "A3F82C1D"
-    // 空着则跳过校验（调试期可用）
-]);
+// ==================== 配置区（只改这里） ====================
+const DLL_HASH_WHITELIST: string[] = [
+    "5A8DF37F",          // ← 改成你 DLL 的 CRC32
+    // 可以填多个，每行一个，用引号包住，逗号结尾
+    // 调试期留空数组 [] 表示不校验
+];
 
-const ADMIN_KEY = "xK9#mP2$vL7@qW3!nR5&jY8"; // 管理接口密钥，部署后改掉
-const MAX_TRANSFER = 3;
-const TRANSFER_COOLDOWN_DAYS = 7;
+const ADMIN_SECRET = "xK9#mP2$vL7@qW3!nR5&jY8";  // ← 改成你自己的密码
 
-// ==================== KV ====================
+const MAX_TRANSFER_COUNT = 3;       // 最大换机次数，不用改
+const TRANSFER_COOLDOWN_DAYS = 7;   // 换机冷却天数，不用改
+// ============================================================
+
+
+
+// ==================== 以下全部不用改 ====================
+
 const kv = await Deno.openKv();
 
-// ==================== 工具 ====================
-function jsonResponse(body: unknown, status = 200): Response {
+// ---------- 工具函数 ----------
+function json(body: unknown, status = 200): Response {
     return new Response(JSON.stringify(body), {
         status,
         headers: { "Content-Type": "application/json" },
     });
 }
 
-function getClientIp(req: Request): string {
-    return req.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
-        ?? req.headers.get("x-real-ip")
-        ?? "unknown";
+function adminOk(req: Request): boolean {
+    const auth = req.headers.get("authorization");
+    return auth === `Bearer ${ADMIN_SECRET}`;
 }
 
-// ==================== 路由 ====================
-async function handleCheck(req: Request): Promise<Response> {
-    if (req.method !== "POST") {
-        return jsonResponse({ error: "method not allowed" }, 405);
-    }
-
+// ---------- /license/check ----------
+async function checkLicense(req: Request): Promise<Response> {
     let body: any;
-    try {
-        body = await req.json();
-    } catch {
-        return jsonResponse({ error: "invalid json" }, 400);
-    }
+    try { body = await req.json(); } catch { return json({ error: "bad json" }, 400); }
 
     const fp = body?.fp;
     const device_code = body?.device_code;
     const dll_hash = body?.dll_hash;
 
-    if (!fp) {
-        return jsonResponse({ error: "missing fp" }, 400);
-    }
+    if (!fp) return json({ error: "missing fp" }, 400);
 
-    // dll_hash 校验（白名单非空时才校验）
-    if (VALID_DLL_HASHES.size > 0 && dll_hash) {
-        if (!VALID_DLL_HASHES.has(dll_hash)) {
-            return jsonResponse({ status: "rejected", reason: "invalid_dll" }, 403);
+    // dll_hash 校验
+    if (DLL_HASH_WHITELIST.length > 0 && dll_hash) {
+        if (!DLL_HASH_WHITELIST.includes(dll_hash)) {
+            return json({ status: "rejected", reason: "invalid_dll" }, 403);
         }
     }
 
@@ -61,22 +59,15 @@ async function handleCheck(req: Request): Promise<Response> {
 
     if (existing.value) {
         const dev = existing.value as any;
-
-        if (dev.status === "banned") {
-            return jsonResponse({ status: "banned" }, 403);
-        }
-
+        if (dev.status === "banned") return json({ status: "banned" }, 403);
         if (dev.status === "active") {
-            // 更新最后在线时间
             await kv.set(devKey, { ...dev, last_seen_at: Date.now() });
-            return jsonResponse({ status: "ok", fp, device_code: dev.device_code ?? null });
+            return json({ status: "ok", fp, device_code: dev.device_code ?? null });
         }
-
-        // initializing / expired / other → 仍待授权
-        return jsonResponse({ status: "not_authorized", fp, device_code: dev.device_code ?? null });
+        return json({ status: "not_authorized", fp, device_code: dev.device_code ?? null });
     }
 
-    // 新设备：原子创建，防并发重复写入
+    // 新设备，原子写入防并发
     const newDev: any = {
         fp,
         device_code: device_code ?? null,
@@ -89,210 +80,137 @@ async function handleCheck(req: Request): Promise<Response> {
         contact: "",
     };
 
-    const atomic = kv.atomic()
-        .check({ key: devKey, versionstamp: null })
-        .set(devKey, newDev);
+    const atom = kv.atomic().check({ key: devKey, versionstamp: null }).set(devKey, newDev);
+    if (device_code) atom.set(["device_code", device_code], fp);
+    await atom.commit();
 
-    // 如果有短码，同时建映射
-    if (device_code) {
-        atomic.set(["device_code", device_code], fp);
-    }
-
-    const result = await atomic.commit();
-
-    if (!result.ok) {
-        // 并发冲突，重新读
-        const retry = await kv.get(devKey);
-        if (retry.value) {
-            const dev = retry.value as any;
-            return jsonResponse({ status: dev.status === "active" ? "ok" : "not_authorized", fp });
-        }
-        return jsonResponse({ status: "error", reason: "concurrent_write_failed" }, 500);
-    }
-
-    return jsonResponse({ status: "not_authorized", fp, device_code });
+    return json({ status: "not_authorized", fp, device_code });
 }
 
-// ==================== 管理接口（统一鉴权） ====================
-function checkAdmin(req: Request): boolean {
-    const auth = req.headers.get("authorization");
-    return auth === `Bearer ${ADMIN_KEY}`;
-}
-
-async function handleAdminPending(req: Request): Promise<Response> {
-    if (!checkAdmin(req)) return jsonResponse({ error: "unauthorized" }, 401);
-
+// ---------- 管理接口 ----------
+async function adminPending(req: Request): Promise<Response> {
+    if (!adminOk(req)) return json({ error: "unauthorized" }, 401);
     const url = new URL(req.url);
     const code = url.searchParams.get("code");
 
     if (code) {
-        // 按短码查
         const fpEntry = await kv.get(["device_code", code]);
-        if (!fpEntry.value) {
-            return jsonResponse({ error: "device_code not found" }, 404);
-        }
+        if (!fpEntry.value) return json({ error: "not found" }, 404);
         const dev = await kv.get(["device", fpEntry.value as string]);
-        return jsonResponse({
-            device_code: code,
-            fp: fpEntry.value,
-            device: dev.value ?? null,
-        });
+        return json({ device_code: code, fp: fpEntry.value, device: dev.value });
     }
 
-    // 列出所有 initializing 设备
-    const devices: any[] = [];
-    const iter = kv.list({ prefix: ["device"] });
-    for await (const entry of iter) {
-        const dev = entry.value as any;
-        if (dev.status === "initializing" || dev.status === "not_authorized") {
-            devices.push(dev);
-        }
+    const list: any[] = [];
+    for await (const e of kv.list({ prefix: ["device"] })) {
+        const d = e.value as any;
+        if (d.status === "initializing" || d.status === "not_authorized") list.push(d);
     }
-
-    return jsonResponse({ count: devices.length, devices });
+    return json({ count: list.length, devices: list });
 }
 
-async function handleAdminActivate(req: Request): Promise<Response> {
-    if (!checkAdmin(req)) return jsonResponse({ error: "unauthorized" }, 401);
-    if (req.method !== "POST") return jsonResponse({ error: "method not allowed" }, 405);
-
+async function adminActivate(req: Request): Promise<Response> {
+    if (!adminOk(req)) return json({ error: "unauthorized" }, 401);
     let body: any;
-    try { body = await req.json(); } catch { return jsonResponse({ error: "invalid json" }, 400); }
+    try { body = await req.json(); } catch { return json({ error: "bad json" }, 400); }
 
     let fp = body?.fp;
     const code = body?.device_code;
-    const expires_at = body?.expires_at ?? null;
-    const note = body?.note ?? "";
-    const contact = body?.contact ?? "";
 
-    // 支持用短码反查 fp
     if (!fp && code) {
-        const fpEntry = await kv.get(["device_code", code]);
-        if (!fpEntry.value) {
-            return jsonResponse({ error: "device_code not found" }, 404);
-        }
-        fp = fpEntry.value as string;
+        const e = await kv.get(["device_code", code]);
+        if (!e.value) return json({ error: "device_code not found" }, 404);
+        fp = e.value as string;
     }
-
-    if (!fp) return jsonResponse({ error: "missing fp or device_code" }, 400);
+    if (!fp) return json({ error: "missing fp" }, 400);
 
     const devKey = ["device", fp];
     const existing = await kv.get(devKey);
-
-    if (!existing.value) {
-        return jsonResponse({ error: "device not found, ask user to run DLL first" }, 404);
-    }
+    if (!existing.value) return json({ error: "device not found" }, 404);
 
     const dev = existing.value as any;
-    const updated = {
+    await kv.set(devKey, {
         ...dev,
         status: "active",
         activated_at: Date.now(),
-        expires_at,
-        note,
-        contact,
-    };
+        expires_at: body?.expires_at ?? null,
+        note: body?.note ?? "",
+        contact: body?.contact ?? "",
+    });
 
-    await kv.set(devKey, updated);
-
-    return jsonResponse({ status: "activated", fp, device_code: dev.device_code ?? null });
+    return json({ status: "activated", fp, device_code: dev.device_code ?? null });
 }
 
-async function handleAdminReplace(req: Request): Promise<Response> {
-    if (!checkAdmin(req)) return jsonResponse({ error: "unauthorized" }, 401);
-    if (req.method !== "POST") return jsonResponse({ error: "method not allowed" }, 405);
-
+async function adminRevoke(req: Request): Promise<Response> {
+    if (!adminOk(req)) return json({ error: "unauthorized" }, 401);
     let body: any;
-    try { body = await req.json(); } catch { return jsonResponse({ error: "invalid json" }, 400); }
-
-    const old_fp = body?.old_fp;
-    const new_fp = body?.new_fp;
-    if (!old_fp || !new_fp) return jsonResponse({ error: "missing old_fp or new_fp" }, 400);
-
-    const oldKey = ["device", old_fp];
-    const oldEntry = await kv.get(oldKey);
-    if (!oldEntry.value) return jsonResponse({ error: "old device not found" }, 404);
-
-    const oldDev = oldEntry.value as any;
-
-    // 检查换机次数
-    if ((oldDev.transfer_count ?? 0) >= MAX_TRANSFER) {
-        return jsonResponse({ error: "max transfer count exceeded" }, 403);
-    }
-
-    // 新设备如果存在，检查是否被他人用过
-    const newKey = ["device", new_fp];
-    const newEntry = await kv.get(newKey);
-    if (newEntry.value) {
-        const newDev = newEntry.value as any;
-        if (newDev.hwid_history && newDev.hwid_history.some((h: string) => h !== new_fp && h !== old_fp)) {
-            return jsonResponse({ error: "new device has been used by another user" }, 403);
-        }
-    }
-
-    // 原子操作：旧设备拉黑 + 新设备激活
-    const now = Date.now();
-    const updatedOld = { ...oldDev, status: "banned", banned_at: now, ban_reason: "transferred" };
-    const newDev: any = {
-        fp: new_fp,
-        device_code: oldDev.device_code,
-        status: "active",
-        activated_at: now,
-        expires_at: oldDev.expires_at,
-        note: oldDev.note,
-        contact: oldDev.contact,
-        hwid_history: [new_fp],
-        transfer_count: 0,
-        created_at: now,
-        last_seen_at: now,
-    };
-
-    await kv.atomic()
-        .set(oldKey, updatedOld)
-        .set(newKey, newDev)
-        .commit();
-
-    return jsonResponse({ status: "replaced", old_fp, new_fp });
-}
-
-async function handleAdminRevoke(req: Request): Promise<Response> {
-    if (!checkAdmin(req)) return jsonResponse({ error: "unauthorized" }, 401);
-    if (req.method !== "POST") return jsonResponse({ error: "method not allowed" }, 405);
-
-    let body: any;
-    try { body = await req.json(); } catch { return jsonResponse({ error: "invalid json" }, 400); }
-
+    try { body = await req.json(); } catch { return json({ error: "bad json" }, 400); }
     const fp = body?.fp;
-    if (!fp) return jsonResponse({ error: "missing fp" }, 400);
+    if (!fp) return json({ error: "missing fp" }, 400);
 
     const devKey = ["device", fp];
     const existing = await kv.get(devKey);
-    if (!existing.value) return jsonResponse({ error: "device not found" }, 404);
+    if (!existing.value) return json({ error: "not found" }, 404);
 
     const dev = existing.value as any;
-    await kv.set(devKey, { ...dev, status: "banned", banned_at: Date.now(), ban_reason: "revoked_by_admin" });
-
-    return jsonResponse({ status: "revoked", fp });
+    await kv.set(devKey, { ...dev, status: "banned", banned_at: Date.now(), ban_reason: "revoked" });
+    return json({ status: "revoked", fp });
 }
 
-async function handleAdminList(req: Request): Promise<Response> {
-    if (!checkAdmin(req)) return jsonResponse({ error: "unauthorized" }, 401);
+async function adminList(req: Request): Promise<Response> {
+    if (!adminOk(req)) return json({ error: "unauthorized" }, 401);
+    const list: any[] = [];
+    for await (const e of kv.list({ prefix: ["device"] })) list.push(e.value);
+    return json({ count: list.length, devices: list });
+}
 
-    const devices: any[] = [];
-    const iter = kv.list({ prefix: ["device"] });
-    for await (const entry of iter) {
-        devices.push(entry.value);
+async function adminReplace(req: Request): Promise<Response> {
+    if (!adminOk(req)) return json({ error: "unauthorized" }, 401);
+    let body: any;
+    try { body = await req.json(); } catch { return json({ error: "bad json" }, 400); }
+
+    const old_fp = body?.old_fp;
+    const new_fp = body?.new_fp;
+    if (!old_fp || !new_fp) return json({ error: "missing old_fp or new_fp" }, 400);
+
+    const oldKey = ["device", old_fp];
+    const oldEntry = await kv.get(oldKey);
+    if (!oldEntry.value) return json({ error: "old device not found" }, 404);
+
+    const oldDev = oldEntry.value as any;
+    if ((oldDev.transfer_count ?? 0) >= MAX_TRANSFER_COUNT) {
+        return json({ error: "max transfer exceeded" }, 403);
     }
 
-    return jsonResponse({ count: devices.length, devices });
+    const now = Date.now();
+    await kv.atomic()
+        .set(oldKey, { ...oldDev, status: "banned", banned_at: now, ban_reason: "transferred" })
+        .set(["device", new_fp], {
+            fp: new_fp,
+            device_code: oldDev.device_code,
+            status: "active",
+            activated_at: now,
+            expires_at: oldDev.expires_at,
+            note: oldDev.note,
+            contact: oldDev.contact,
+            hwid_history: [new_fp],
+            transfer_count: 0,
+            created_at: now,
+            last_seen_at: now,
+        })
+        .commit();
+
+    return json({ status: "replaced", old_fp, new_fp });
 }
 
-// ==================== 入口 ====================
+// ==================== 启动入口（不要改这里） ====================
+console.log("F210 Auth Server v2.4.1");
+console.log("Listening on http://0.0.0.0:8000/");
+
 Deno.serve(async (req: Request) => {
     const url = new URL(req.url);
     const path = url.pathname;
 
-    // CORS（调试用，生产可删）
+    // CORS 预检
     if (req.method === "OPTIONS") {
         return new Response(null, {
             headers: {
@@ -305,31 +223,17 @@ Deno.serve(async (req: Request) => {
 
     try {
         if (path === "/license/check" && req.method === "POST") {
-            return await handleCheck(req);
+            return await checkLicense(req);
         }
+        if (path === "/admin/pending") return await adminPending(req);
+        if (path === "/admin/activate" && req.method === "POST") return await adminActivate(req);
+        if (path === "/admin/replace" && req.method === "POST") return await adminReplace(req);
+        if (path === "/admin/revoke" && req.method === "POST") return await adminRevoke(req);
+        if (path === "/admin/list") return await adminList(req);
 
-        if (path === "/admin/pending") {
-            return await handleAdminPending(req);
-        }
-
-        if (path === "/admin/activate" && req.method === "POST") {
-            return await handleAdminActivate(req);
-        }
-
-        if (path === "/admin/replace" && req.method === "POST") {
-            return await handleAdminReplace(req);
-        }
-
-        if (path === "/admin/revoke" && req.method === "POST") {
-            return await handleAdminRevoke(req);
-        }
-
-        if (path === "/admin/list") {
-            return await handleAdminList(req);
-        }
-
-        return jsonResponse({ error: "not found", path }, 404);
+        return json({ error: "not found", path }, 404);
     } catch (e: any) {
-        return jsonResponse({ error: "internal error", detail: e.message }, 500);
+        console.error("Unhandled error:", e);
+        return json({ error: "internal", detail: e.message }, 500);
     }
 });
