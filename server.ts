@@ -1,419 +1,335 @@
 // server.ts — F210 Auth Server v2.0
-// Deno Deploy 原生 KV
+// Deno Deploy 入口文件
 
-/* ==================== 配置 ==================== */
-const TRANSFER_LIMIT = 3;
-const COOLDOWN_DAYS = 7;
-const ACTIVE = "active";
-const INITIALIZING = "initializing";
-const REVOKED = "revoked";
-const SUSPENDED = "suspended";
-
-// DLL 哈希白名单（编译后填入真实值）
-const VALID_DLL_HASHES: Set<string> = new Set([
-  // "5A8DF37F"
+// ==================== 配置 ====================
+const VALID_DLL_HASHES = new Set([
+    "5A8DF37F" // 填入你 DLL 的 CRC32，如 "A3F82C1D"
+    // 空着则跳过校验（调试期可用）
 ]);
 
-/* ==================== KV ==================== */
+const ADMIN_KEY = "xK9#mP2$vL7@qW3!nR5&jY8"; // 管理接口密钥，部署后改掉
+const MAX_TRANSFER = 3;
+const TRANSFER_COOLDOWN_DAYS = 7;
+
+// ==================== KV ====================
 const kv = await Deno.openKv();
 
-/* ==================== 类型 ==================== */
-interface Device {
-  fp: string;
-  board: string;
-  cpu: string;
-  status: string;
-  device_code: string;
-  dll_hash: string;
-  version: string;
-  transfer_count: number;
-  last_transfer_at: string;       // ISO 格式
-  transfer_cooldown_days: number;
-  hwid_history: string[];
-  activated_at: string;
-  last_seen: string;
-  last_ip: string;
-  ban_reason: string;
-  request_count: number;
-  created_at: string;
-  expires_at: string;
-  max_pcs: number;
-  features: string[];
-  trial: boolean;
-  note: string;
-  contact: string;
-  order_ref: string;
-  price_tier: string;
-  source_platform: string;
-  platform_id: string;
-  platform_nick: string;
-  wechat_id: string;
-  wechat_nick: string;
-  purchase_date: string;
-  payment_amount: number;
-  subscription_type: string;
+// ==================== 工具 ====================
+function jsonResponse(body: unknown, status = 200): Response {
+    return new Response(JSON.stringify(body), {
+        status,
+        headers: { "Content-Type": "application/json" },
+    });
 }
 
-/* ==================== 工具 ==================== */
-function nowISO(): string {
-  return new Date().toISOString().slice(0, 19).replace("T", " ");
+function getClientIp(req: Request): string {
+    return req.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
+        ?? req.headers.get("x-real-ip")
+        ?? "unknown";
 }
 
-function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-/* ==================== /license/check ==================== */
+// ==================== 路由 ====================
 async function handleCheck(req: Request): Promise<Response> {
-  let body: any;
-  try { body = await req.json(); } catch { return json({ error: "invalid json" }, 400); }
-
-  const fp: string = body.fp || "";
-  const board: string = body.board || "";
-  const cpu: string = body.cpu || "";
-  const ts: number = body.ts || 0;
-  const nonce: string = body.nonce || "";
-  const sig: string = body.sig || "";
-  const dll_hash: string = body.dll_hash || "";
-  const device_code: string = body.device_code || "";
-  const client_version: string = body.version || "";
-
-  // fp 格式校验
-  if (!fp || fp.length !== 32) return json({ error: "invalid fp" }, 400);
-
-  // DLL 完整性校验（可选严格模式）
-  if (dll_hash && VALID_DLL_HASHES.size > 0 && !VALID_DLL_HASHES.has(dll_hash)) {
-    console.warn(`[WARN] Unknown dll_hash=${dll_hash} fp=${fp}`);
-    // return json({ status: "not_authorized", message: "客户端校验失败" }, 403);
-  }
-
-  // 查设备
-  const devKey = ["device", fp];
-  const devRec = await kv.get<Device>(devKey);
-
-  if (devRec.value) {
-    const dev = devRec.value;
-
-    // 更新心跳
-    dev.last_seen = nowISO();
-    dev.request_count = (dev.request_count || 0) + 1;
-    if (dll_hash) dev.dll_hash = dll_hash;
-    if (device_code) dev.device_code = device_code;
-
-    if (dev.status === ACTIVE) {
-      await kv.set(devKey, dev);
-      return json({ status: "ok", fp, device_code: dev.device_code });
+    if (req.method !== "POST") {
+        return jsonResponse({ error: "method not allowed" }, 405);
     }
 
-    if (dev.status === REVOKED) {
-      return json({ status: "revoked", message: "设备已被拉黑" }, 403);
+    let body: any;
+    try {
+        body = await req.json();
+    } catch {
+        return jsonResponse({ error: "invalid json" }, 400);
     }
 
-    if (dev.status === SUSPENDED) {
-      return json({ status: "suspended", message: "设备已暂停" }, 403);
+    const fp = body?.fp;
+    const device_code = body?.device_code;
+    const dll_hash = body?.dll_hash;
+
+    if (!fp) {
+        return jsonResponse({ error: "missing fp" }, 400);
     }
 
-    if (dev.status === INITIALIZING) {
-      await kv.set(devKey, dev);
-      return json({ status: "not_authorized", message: "设备已登记，请联系作者完成授权", device_code: dev.device_code }, 403);
+    // dll_hash 校验（白名单非空时才校验）
+    if (VALID_DLL_HASHES.size > 0 && dll_hash) {
+        if (!VALID_DLL_HASHES.has(dll_hash)) {
+            return jsonResponse({ status: "rejected", reason: "invalid_dll" }, 403);
+        }
     }
 
-    await kv.set(devKey, dev);
-    return json({ status: dev.status }, 403);
-  }
+    const devKey = ["device", fp];
+    const existing = await kv.get(devKey);
 
-  // 新设备 → 自动注册 initializing
-  const now = nowISO();
-  const newDev: Device = {
-    fp,
-    board,
-    cpu,
-    status: INITIALIZING,
-    device_code,
-    dll_hash,
-    version: client_version,
-    transfer_count: 0,
-    last_transfer_at: "",
-    transfer_cooldown_days: COOLDOWN_DAYS,
-    hwid_history: [fp],
-    activated_at: "",
-    last_seen: now,
-    last_ip: req.headers.get("x-forwarded-for") || "",
-    ban_reason: "",
-    request_count: 1,
-    created_at: now,
-    expires_at: "",
-    max_pcs: 1,
-    features: [],
-    trial: false,
-    note: "",
-    contact: "",
-    order_ref: "",
-    price_tier: "",
-    source_platform: "",
-    platform_id: "",
-    platform_nick: "",
-    wechat_id: "",
-    wechat_nick: "",
-    purchase_date: "",
-    payment_amount: 0,
-    subscription_type: "month",
-  };
+    if (existing.value) {
+        const dev = existing.value as any;
 
-  // 原子创建
-  const createRes = await kv.atomic()
-    .check({ key: devKey, versionstamp: null })
-    .set(devKey, newDev)
-    .commit();
+        if (dev.status === "banned") {
+            return jsonResponse({ status: "banned" }, 403);
+        }
 
-  if (!createRes.ok) {
-    // 并发冲突，重新读取
-    const retry = await kv.get<Device>(devKey);
-    if (retry.value) {
-      return json({ status: "not_authorized", message: "设备已登记，请联系作者完成授权", device_code: retry.value.device_code }, 403);
+        if (dev.status === "active") {
+            // 更新最后在线时间
+            await kv.set(devKey, { ...dev, last_seen_at: Date.now() });
+            return jsonResponse({ status: "ok", fp, device_code: dev.device_code ?? null });
+        }
+
+        // initializing / expired / other → 仍待授权
+        return jsonResponse({ status: "not_authorized", fp, device_code: dev.device_code ?? null });
     }
-  }
 
-  // 同时建立 device_code → fp 映射
-  if (device_code) {
-    await kv.set(["device_code", device_code], fp);
-  }
-
-  return json({ status: "not_authorized", message: "设备已登记，请联系作者完成授权", device_code }, 403);
-}
-
-/* ==================== /admin/pending ==================== */
-async function handlePending(req: Request): Promise<Response> {
-  const url = new URL(req.url);
-  const code = url.searchParams.get("code");
-
-  if (code) {
-    // 按短码查
-    const fpRes = await kv.get<string>(["device_code", code]);
-    if (!fpRes.value) return json({ error: "设备码不存在" }, 404);
-    const devRes = await kv.get<Device>(["device", fpRes.value]);
-    if (!devRes.value) return json({ error: "设备记录不存在" }, 404);
-    return json({ device: devRes.value });
-  }
-
-  // 列出所有 initializing 设备
-  const pending: Device[] = [];
-  const iter = kv.list<Device>({ prefix: ["device"] });
-  for await (const entry of iter) {
-    if (entry.value.status === INITIALIZING) {
-      pending.push(entry.value);
-    }
-  }
-
-  return json({ count: pending.length, pending });
-}
-
-/* ==================== /admin/activate ==================== */
-async function handleActivate(req: Request): Promise<Response> {
-  let body: any;
-  try { body = await req.json(); } catch { return json({ error: "invalid json" }, 400); }
-
-  const fp: string = body.fp || "";
-  const device_code: string = body.device_code || "";
-  const expires_at: string = body.expires_at || "";
-  const note: string = body.note || "";
-  const contact: string = body.contact || "";
-
-  let targetFp = fp;
-
-  // 如果传的是短码，先解析
-  if (!fp && device_code) {
-    const fpRes = await kv.get<string>(["device_code", device_code]);
-    if (!fpRes.value) return json({ error: "设备码不存在" }, 404);
-    targetFp = fpRes.value;
-  }
-
-  if (!targetFp) return json({ error: "fp or device_code required" }, 400);
-
-  const devKey = ["device", targetFp];
-  const devRec = await kv.get<Device>(devKey);
-  if (!devRec.value) return json({ error: "设备不存在" }, 404);
-
-  const dev = devRec.value;
-  dev.status = ACTIVE;
-  dev.activated_at = nowISO();
-  dev.last_seen = nowISO();
-  if (expires_at) dev.expires_at = expires_at;
-  if (note) dev.note = note;
-  if (contact) dev.contact = contact;
-
-  const res = await kv.atomic()
-    .check({ key: devKey, versionstamp: devRec.versionstamp })
-    .set(devKey, dev)
-    .commit();
-
-  if (!res.ok) return json({ error: "并发冲突，请重试" }, 409);
-
-  return json({ status: "ok", fp: targetFp, device_code: dev.device_code, expires_at: dev.expires_at });
-}
-
-/* ==================== /admin/replace（换机） ==================== */
-async function handleReplace(req: Request): Promise<Response> {
-  let body: any;
-  try { body = await req.json(); } catch { return json({ error: "invalid json" }, 400); }
-
-  const old_fp: string = body.old_fp || "";
-  const new_fp: string = body.new_fp || "";
-
-  if (!old_fp || !new_fp || old_fp === new_fp) return json({ error: "invalid params" }, 400);
-
-  const oldKey = ["device", old_fp];
-  const newKey = ["device", new_fp];
-
-  const oldRec = await kv.get<Device>(oldKey);
-  const newRec = await kv.get<Device>(newKey);
-
-  if (!oldRec.value) return json({ error: "旧设备不存在" }, 404);
-
-  const oldDev = oldRec.value;
-
-  // 冷却期检查
-  if (oldDev.last_transfer_at) {
-    const lastTransfer = new Date(oldDev.last_transfer_at.replace(" ", "T"));
-    const daysSince = (Date.now() - lastTransfer.getTime()) / 86400000;
-    const cooldown = oldDev.transfer_cooldown_days || COOLDOWN_DAYS;
-    if (daysSince < cooldown) {
-      return json({ error: `冷却期未过，剩余 ${Math.ceil(cooldown - daysSince)} 天` }, 403);
-    }
-  }
-
-  // 换机次数上限
-  if (oldDev.transfer_count >= TRANSFER_LIMIT) {
-    return json({ error: `换机次数已达上限 (${TRANSFER_LIMIT})` }, 403);
-  }
-
-  // 新设备检查
-  if (newRec.value) {
-    const newDev = newRec.value;
-    if (newDev.status === ACTIVE) {
-      return json({ error: "新设备已有活跃授权（疑似倒卖）" }, 403);
-    }
-    // 历史冲突检查
-    const otherFps = newDev.hwid_history.filter(h => h !== old_fp);
-    if (otherFps.length > 0) {
-      // 标记旧设备为 revoked
-      oldDev.status = REVOKED;
-      oldDev.ban_reason = "换机检测到倒卖风险";
-      await kv.set(oldKey, oldDev);
-      return json({ error: "新设备历史异常，疑似倒卖" }, 403);
-    }
-  }
-
-  // 执行换机
-  const now = nowISO();
-  const newTransferCount = oldDev.transfer_count + 1;
-
-  oldDev.status = REVOKED;
-  oldDev.ban_reason = `换机-旧设备拉黑 (#${newTransferCount})`;
-
-  let updatedNewDev: Device;
-  if (newRec.value) {
-    updatedNewDev = { ...newRec.value };
-    updatedNewDev.status = ACTIVE;
-    updatedNewDev.transfer_count = newTransferCount;
-    updatedNewDev.last_transfer_at = now;
-    updatedNewDev.hwid_history = [...newRec.value!.hwid_history, old_fp];
-    updatedNewDev.activated_at = updatedNewDev.activated_at || now;
-    updatedNewDev.last_seen = now;
-  } else {
-    updatedNewDev = {
-      ...oldDev,
-      fp: new_fp,
-      board: body.new_board || "",
-      cpu: body.new_cpu || "",
-      status: ACTIVE,
-      transfer_count: newTransferCount,
-      last_transfer_at: now,
-      hwid_history: [old_fp],
-      created_at: now,
-      last_seen: now,
+    // 新设备：原子创建，防并发重复写入
+    const newDev: any = {
+        fp,
+        device_code: device_code ?? null,
+        status: "initializing",
+        created_at: Date.now(),
+        last_seen_at: Date.now(),
+        hwid_history: [fp],
+        transfer_count: 0,
+        note: "",
+        contact: "",
     };
-  }
 
-  const txRes = await kv.atomic()
-    .check({ key: oldKey, versionstamp: oldRec.versionstamp })
-    .check({ key: newKey, versionstamp: newRec.versionstamp })
-    .set(oldKey, oldDev)
-    .set(newKey, updatedNewDev)
-    .commit();
+    const atomic = kv.atomic()
+        .check({ key: devKey, versionstamp: null })
+        .set(devKey, newDev);
 
-  if (!txRes.ok) return json({ error: "并发冲突，请重试" }, 409);
-
-  return json({ status: "ok", transfer_count: newTransferCount, remaining: TRANSFER_LIMIT - newTransferCount });
-}
-
-/* ==================== /admin/revoke ==================== */
-async function handleRevoke(req: Request): Promise<Response> {
-  let body: any;
-  try { body = await req.json(); } catch { return json({ error: "invalid json" }, 400); }
-
-  const fp: string = body.fp || "";
-  const device_code: string = body.device_code || "";
-  const reason: string = body.reason || "管理员手动拉黑";
-
-  let targetFp = fp;
-  if (!fp && device_code) {
-    const fpRes = await kv.get<string>(["device_code", device_code]);
-    if (!fpRes.value) return json({ error: "设备码不存在" }, 404);
-    targetFp = fpRes.value;
-  }
-
-  const devKey = ["device", targetFp];
-  const devRec = await kv.get<Device>(devKey);
-  if (!devRec.value) return json({ error: "设备不存在" }, 404);
-
-  devRec.value.status = REVOKED;
-  devRec.value.ban_reason = reason;
-
-  await kv.set(devKey, devRec.value);
-  return json({ status: "ok", fp: targetFp });
-}
-
-/* ==================== /admin/list ==================== */
-async function handleList(req: Request): Promise<Response> {
-  const url = new URL(req.url);
-  const status = url.searchParams.get("status");
-  const limit = parseInt(url.searchParams.get("limit") || "50");
-
-  const devices: Device[] = [];
-  const iter = kv.list<Device>({ prefix: ["device"] });
-  for await (const entry of iter) {
-    if (!status || entry.value.status === status) {
-      devices.push(entry.value);
+    // 如果有短码，同时建映射
+    if (device_code) {
+        atomic.set(["device_code", device_code], fp);
     }
-    if (devices.length >= limit) break;
-  }
 
-  return json({ count: devices.length, devices });
+    const result = await atomic.commit();
+
+    if (!result.ok) {
+        // 并发冲突，重新读
+        const retry = await kv.get(devKey);
+        if (retry.value) {
+            const dev = retry.value as any;
+            return jsonResponse({ status: dev.status === "active" ? "ok" : "not_authorized", fp });
+        }
+        return jsonResponse({ status: "error", reason: "concurrent_write_failed" }, 500);
+    }
+
+    return jsonResponse({ status: "not_authorized", fp, device_code });
 }
 
-/* ==================== 路由 ==================== */
+// ==================== 管理接口（统一鉴权） ====================
+function checkAdmin(req: Request): boolean {
+    const auth = req.headers.get("authorization");
+    return auth === `Bearer ${ADMIN_KEY}`;
+}
+
+async function handleAdminPending(req: Request): Promise<Response> {
+    if (!checkAdmin(req)) return jsonResponse({ error: "unauthorized" }, 401);
+
+    const url = new URL(req.url);
+    const code = url.searchParams.get("code");
+
+    if (code) {
+        // 按短码查
+        const fpEntry = await kv.get(["device_code", code]);
+        if (!fpEntry.value) {
+            return jsonResponse({ error: "device_code not found" }, 404);
+        }
+        const dev = await kv.get(["device", fpEntry.value as string]);
+        return jsonResponse({
+            device_code: code,
+            fp: fpEntry.value,
+            device: dev.value ?? null,
+        });
+    }
+
+    // 列出所有 initializing 设备
+    const devices: any[] = [];
+    const iter = kv.list({ prefix: ["device"] });
+    for await (const entry of iter) {
+        const dev = entry.value as any;
+        if (dev.status === "initializing" || dev.status === "not_authorized") {
+            devices.push(dev);
+        }
+    }
+
+    return jsonResponse({ count: devices.length, devices });
+}
+
+async function handleAdminActivate(req: Request): Promise<Response> {
+    if (!checkAdmin(req)) return jsonResponse({ error: "unauthorized" }, 401);
+    if (req.method !== "POST") return jsonResponse({ error: "method not allowed" }, 405);
+
+    let body: any;
+    try { body = await req.json(); } catch { return jsonResponse({ error: "invalid json" }, 400); }
+
+    let fp = body?.fp;
+    const code = body?.device_code;
+    const expires_at = body?.expires_at ?? null;
+    const note = body?.note ?? "";
+    const contact = body?.contact ?? "";
+
+    // 支持用短码反查 fp
+    if (!fp && code) {
+        const fpEntry = await kv.get(["device_code", code]);
+        if (!fpEntry.value) {
+            return jsonResponse({ error: "device_code not found" }, 404);
+        }
+        fp = fpEntry.value as string;
+    }
+
+    if (!fp) return jsonResponse({ error: "missing fp or device_code" }, 400);
+
+    const devKey = ["device", fp];
+    const existing = await kv.get(devKey);
+
+    if (!existing.value) {
+        return jsonResponse({ error: "device not found, ask user to run DLL first" }, 404);
+    }
+
+    const dev = existing.value as any;
+    const updated = {
+        ...dev,
+        status: "active",
+        activated_at: Date.now(),
+        expires_at,
+        note,
+        contact,
+    };
+
+    await kv.set(devKey, updated);
+
+    return jsonResponse({ status: "activated", fp, device_code: dev.device_code ?? null });
+}
+
+async function handleAdminReplace(req: Request): Promise<Response> {
+    if (!checkAdmin(req)) return jsonResponse({ error: "unauthorized" }, 401);
+    if (req.method !== "POST") return jsonResponse({ error: "method not allowed" }, 405);
+
+    let body: any;
+    try { body = await req.json(); } catch { return jsonResponse({ error: "invalid json" }, 400); }
+
+    const old_fp = body?.old_fp;
+    const new_fp = body?.new_fp;
+    if (!old_fp || !new_fp) return jsonResponse({ error: "missing old_fp or new_fp" }, 400);
+
+    const oldKey = ["device", old_fp];
+    const oldEntry = await kv.get(oldKey);
+    if (!oldEntry.value) return jsonResponse({ error: "old device not found" }, 404);
+
+    const oldDev = oldEntry.value as any;
+
+    // 检查换机次数
+    if ((oldDev.transfer_count ?? 0) >= MAX_TRANSFER) {
+        return jsonResponse({ error: "max transfer count exceeded" }, 403);
+    }
+
+    // 新设备如果存在，检查是否被他人用过
+    const newKey = ["device", new_fp];
+    const newEntry = await kv.get(newKey);
+    if (newEntry.value) {
+        const newDev = newEntry.value as any;
+        if (newDev.hwid_history && newDev.hwid_history.some((h: string) => h !== new_fp && h !== old_fp)) {
+            return jsonResponse({ error: "new device has been used by another user" }, 403);
+        }
+    }
+
+    // 原子操作：旧设备拉黑 + 新设备激活
+    const now = Date.now();
+    const updatedOld = { ...oldDev, status: "banned", banned_at: now, ban_reason: "transferred" };
+    const newDev: any = {
+        fp: new_fp,
+        device_code: oldDev.device_code,
+        status: "active",
+        activated_at: now,
+        expires_at: oldDev.expires_at,
+        note: oldDev.note,
+        contact: oldDev.contact,
+        hwid_history: [new_fp],
+        transfer_count: 0,
+        created_at: now,
+        last_seen_at: now,
+    };
+
+    await kv.atomic()
+        .set(oldKey, updatedOld)
+        .set(newKey, newDev)
+        .commit();
+
+    return jsonResponse({ status: "replaced", old_fp, new_fp });
+}
+
+async function handleAdminRevoke(req: Request): Promise<Response> {
+    if (!checkAdmin(req)) return jsonResponse({ error: "unauthorized" }, 401);
+    if (req.method !== "POST") return jsonResponse({ error: "method not allowed" }, 405);
+
+    let body: any;
+    try { body = await req.json(); } catch { return jsonResponse({ error: "invalid json" }, 400); }
+
+    const fp = body?.fp;
+    if (!fp) return jsonResponse({ error: "missing fp" }, 400);
+
+    const devKey = ["device", fp];
+    const existing = await kv.get(devKey);
+    if (!existing.value) return jsonResponse({ error: "device not found" }, 404);
+
+    const dev = existing.value as any;
+    await kv.set(devKey, { ...dev, status: "banned", banned_at: Date.now(), ban_reason: "revoked_by_admin" });
+
+    return jsonResponse({ status: "revoked", fp });
+}
+
+async function handleAdminList(req: Request): Promise<Response> {
+    if (!checkAdmin(req)) return jsonResponse({ error: "unauthorized" }, 401);
+
+    const devices: any[] = [];
+    const iter = kv.list({ prefix: ["device"] });
+    for await (const entry of iter) {
+        devices.push(entry.value);
+    }
+
+    return jsonResponse({ count: devices.length, devices });
+}
+
+// ==================== 入口 ====================
 Deno.serve(async (req: Request) => {
-  const url = new URL(req.url);
-  const path = url.pathname;
-  const method = req.method;
+    const url = new URL(req.url);
+    const path = url.pathname;
 
-  // CORS
-  if (method === "OPTIONS") {
-    return new Response(null, { headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST,GET,OPTIONS", "Access-Control-Allow-Headers": "Content-Type" } });
-  }
+    // CORS（调试用，生产可删）
+    if (req.method === "OPTIONS") {
+        return new Response(null, {
+            headers: {
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            },
+        });
+    }
 
-  if (method === "POST" && path === "/license/check") return handleCheck(req);
-  if (method === "GET" && path === "/admin/pending") return handlePending(req);
-  if (method === "POST" && path === "/admin/activate") return handleActivate(req);
-  if (method === "POST" && path === "/admin/replace") return handleReplace(req);
-  if (method === "POST" && path === "/admin/revoke") return handleRevoke(req);
-  if (method === "GET" && path === "/admin/list") return handleList(req);
+    try {
+        if (path === "/license/check" && req.method === "POST") {
+            return await handleCheck(req);
+        }
 
-  return json({ error: "not found", paths: ["POST /license/check", "GET /admin/pending", "POST /admin/activate", "POST /admin/replace", "POST /admin/revoke", "GET /admin/list"] }, 404);
+        if (path === "/admin/pending") {
+            return await handleAdminPending(req);
+        }
+
+        if (path === "/admin/activate" && req.method === "POST") {
+            return await handleAdminActivate(req);
+        }
+
+        if (path === "/admin/replace" && req.method === "POST") {
+            return await handleAdminReplace(req);
+        }
+
+        if (path === "/admin/revoke" && req.method === "POST") {
+            return await handleAdminRevoke(req);
+        }
+
+        if (path === "/admin/list") {
+            return await handleAdminList(req);
+        }
+
+        return jsonResponse({ error: "not found", path }, 404);
+    } catch (e: any) {
+        return jsonResponse({ error: "internal error", detail: e.message }, 500);
+    }
 });
-
-console.log("F210 Auth Server v2.0 running");
