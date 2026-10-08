@@ -7,7 +7,7 @@ const KV = await Deno.openKv();
 
 const VALID_CONFIG_HASHES: string[] = [];
 const VALID_DLL_CRCS: string[] = [
-    "AF8CFD46"  // ← 填你新编译的 DLL CRC32
+    "11680216"  // ← 填你新编译的 DLL CRC32
 ];
 
 function now_str(): string {
@@ -121,7 +121,7 @@ async function handler(req: Request): Promise<Response> {
                 });
             }
 
-	    // 【推荐】在这里插入请求接收日志
+	    // 👇【推荐】在这里插入请求接收日志
  	    console.log(`[AUTH REQ] IP: ${client_ip}, FP: ${fp}, HWID: ${hwid}, CPU_FP: ${cpu_fp}, BOARD_FP: ${board_fp}, Config: ${config_hash}, DLL: ${dll_crc}, Version: ${version}`);
 
             // ★ P1: nonce 防重放（5分钟 TTL）
@@ -136,37 +136,12 @@ async function handler(req: Request): Promise<Response> {
                 await KV.set(nonce_key, { fp, time: now_str() }, { expireIn: 300 });
             }
 
-            // const config_hash_valid = VALID_CONFIG_HASHES.length === 0 || !config_hash || VALID_CONFIG_HASHES.includes(config_hash);
-            // const dll_crc_valid = VALID_DLL_CRCS.length === 0 || !dll_crc || VALID_DLL_CRCS.includes(dll_crc);
+            const config_hash_valid = VALID_CONFIG_HASHES.length === 0 || !config_hash || VALID_CONFIG_HASHES.includes(config_hash);
+            const dll_crc_valid = VALID_DLL_CRCS.length === 0 || !dll_crc || VALID_DLL_CRCS.includes(dll_crc);
 
             const key = ["device", fp];
             let device_entry = await KV.get<DeviceRecord>(key);
             let device = device_entry.value;
-
-// ... 前面的 nonce 防重放逻辑保持不变 ...
-
-  const config_hash_valid = VALID_CONFIG_HASHES.length === 0 || !config_hash || VALID_CONFIG_HASHES.includes(config_hash);
-  const dll_crc_valid = VALID_DLL_CRCS.length === 0 || !dll_crc || VALID_DLL_CRCS.includes(dll_crc);
-
-  let key = ["device", fp];
-  let device_entry = await KV.get<DeviceRecord>(key);
-  let device = device_entry.value;
-
-    // ↓↓↓ 只加下面这一段，上面那些 let 一个都不要再加 ↓↓↓
-  if (device && device.status === "active") {
-    const oldCpuFp = device.cpu_fp || "";
-    const oldBoardFp = device.board_fp || "";
-    if ((cpu_fp && oldCpuFp && cpu_fp !== oldCpuFp) || 
-        (board_fp && oldBoardFp && board_fp !== oldBoardFp)) {
-      console.log(`[HW CHANGED] Device ${fp}: CPU ${oldCpuFp}->${cpu_fp}, Board ${oldBoardFp}->${board_fp}`);
-      return new Response(JSON.stringify({
-        status: "hardware_changed",
-        message: "Hardware fingerprint changed. Contact admin."
-      }), { headers: cors_headers() });
-    }
-  }
-
-  // ... 后面的 status: "pending" / "active" 逻辑保持不变 ...
 
             if (!device) {
                 device = create_empty_device(fp, hwid);
