@@ -14,7 +14,7 @@ const VALID_CONFIG_HASHES: string[] = [];
 // dll_crc：重要！填真实 DLL CRC32，非空=启用校验
 // 获取方法：编译 DLL 后用 CRC32 工具算 bridge.dll 的值，填进来
 const VALID_DLL_CRCS: string[] = [
-  "6B354021"  // 等 DLL 端实现真实 CRC 后，编译出来填这里
+  "D091F866"  // 等 DLL 端实现真实 CRC 后，编译出来填这里
 ];
 
 // ============ 工具函数 ============
