@@ -136,8 +136,8 @@ async function handler(req: Request): Promise<Response> {
                 await KV.set(nonce_key, { fp, time: now_str() }, { expireIn: 300 });
             }
 
-            const config_hash_valid = VALID_CONFIG_HASHES.length === 0 || !config_hash || VALID_CONFIG_HASHES.includes(config_hash);
-            const dll_crc_valid = VALID_DLL_CRCS.length === 0 || !dll_crc || VALID_DLL_CRCS.includes(dll_crc);
+            // const config_hash_valid = VALID_CONFIG_HASHES.length === 0 || !config_hash || VALID_CONFIG_HASHES.includes(config_hash);
+            // const dll_crc_valid = VALID_DLL_CRCS.length === 0 || !dll_crc || VALID_DLL_CRCS.includes(dll_crc);
 
             const key = ["device", fp];
             let device_entry = await KV.get<DeviceRecord>(key);
