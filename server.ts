@@ -1,302 +1,343 @@
-// server.ts - F210 Auth Server (Deno Deploy + KV 审批流)
-// 部署: deno deploy --project f210-auth --entrypoint server.ts
+/**
+ * server.ts v2.3.3
+ * F210 Auth Server - Deno Deploy / Deno KV
+ */
 
-// ============ 配置（从环境变量读取） ============
+// ============ 配置 ============
+const ADMIN_KEY = Deno.env.get("ADMIN_KEY") || "xK9#mP2$vL7@qW3!nR5&jY8";
+const KV = await Deno.openKv();
 
-// 【重要】填入你的 CRC32 哈希值（大写，逗号分隔）
-// 例如: "237BCABA,A1B2C3D4"
-const CONFIG_HASH_ALLOWLIST = new Set(
-  (Deno.env.get("CONFIG_HASH_ALLOWLIST") ?? "66C5B52C")
-    .split(",")
-    .map(s => s.trim().toUpperCase())
-    .filter(Boolean)
-);
+// ============ 哈希白名单 ============
+// config_hash：暂不需要，空数组=跳过校验
+const VALID_CONFIG_HASHES: string[] = [];
 
-// 允许的 DLL CRC32 白名单（防 DLL 被篡改）
-const DLL_CRC_ALLOWLIST = new Set(
-  (Deno.env.get("DLL_CRC_ALLOWLIST") ?? "66C5B52C")
-    .split(",")
-    .map(s => s.trim().toUpperCase())
-    .filter(Boolean)
-);
+// dll_crc：重要！填真实 DLL CRC32，非空=启用校验
+// 获取方法：编译 DLL 后用 CRC32 工具算 bridge.dll 的值，填进来
+const VALID_DLL_CRCS: string[] = [
+  "6B354021"  // 等 DLL 端实现真实 CRC 后，编译出来填这里
+];
 
-// 管理员密钥（用于审批接口）
-const ADMIN_KEY = Deno.env.get("ADMIN_KEY") ?? "zengzong323232";
-
-// 允许的版本
-const ALLOWED_VERSIONS = new Set(
-  (Deno.env.get("ALLOWED_VERSIONS") ?? "2.1.0")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean)
-);
-
-// 初始化 Deno KV 数据库
-const kv = await Deno.openKv();
-
-// ============ KV 工具函数 ============
-
-interface AuthEntry {
-  hwid: string;
-  expires_at?: number;
-  note?: string;
-  approved_at: number;
-  version?: string;
-  device_code?: string;
-  dll_crc?: string;
+// ============ 工具函数 ============
+function now_str(): string {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-interface PendingEntry {
-  hwid: string;
+function gen_device_code(): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let code = "";
+  for (let i = 0; i < 8; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
+
+function cors_headers(): Headers {
+  const h = new Headers();
+  h.set("Content-Type", "application/json");
+  h.set("Access-Control-Allow-Origin", "*");
+  h.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  h.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  return h;
+}
+
+// ============ 设备数据结构 ============
+interface DeviceRecord {
   fp: string;
-  config_hash?: string;
-  dll_crc?: string;
-  version?: string;
-  device_code?: string;
-  first_seen_at: number;
-  last_seen_at: number;
-  request_count: number;
+  device_code: string | null;
+  hwid: string;
+  status: "initializing" | "pending" | "active" | "revoked" | "banned";
+  created_at: string;
+  last_seen_at: string;
+  last_request: string;
+  activated_at: string | null;
+  expires_at: string | null;
+  allowed_versions: string[];
+  current_version: string | null;
+  hwid_history: string[];
+  transfer_count: number;
+  max_transfers: number;
+  note: string;
+  contact: string;
+  order_id: string | null;
+  purchase_date: string | null;
+  license_type: string | null;
+  total_requests: number;
+  last_ip: string | null;
+  board: string;
+  cpu: string;
+  config_hash: string;
+  dll_crc: string;
+  config_hash_valid?: boolean;
+  dll_crc_valid?: boolean;
 }
 
-async function get_approved(hwid: string): Promise<AuthEntry | null> {
-  const res = await kv.get<AuthEntry>(["approved", hwid.toUpperCase()]);
-  return res.value;
+function create_empty_device(fp: string, hwid: string): DeviceRecord {
+  const now = now_str();
+  return {
+    fp, device_code: null, hwid,
+    status: "initializing",
+    created_at: now, last_seen_at: now, last_request: now,
+    activated_at: null, expires_at: null,
+    allowed_versions: [], current_version: null,
+    hwid_history: [hwid], transfer_count: 0, max_transfers: 3,
+    note: "", contact: "",
+    order_id: null, purchase_date: null, license_type: null,
+    total_requests: 0, last_ip: null,
+    board: "", cpu: "", config_hash: "", dll_crc: "",
+  };
 }
 
-async function set_approved(entry: AuthEntry): Promise<void> {
-  // 如果设置了过期天数，计算毫秒数传给 KV 的 expireIn
-  const expireIn = entry.expires_at ? entry.expires_at - Date.now() : undefined;
-  await kv.set(["approved", entry.hwid.toUpperCase()], entry, { expireIn });
-}
-
-async function delete_approved(hwid: string): Promise<void> {
-  await kv.delete(["approved", hwid.toUpperCase()]);
-}
-
-async function get_pending(hwid: string): Promise<PendingEntry | null> {
-  const res = await kv.get<PendingEntry>(["pending", hwid.toUpperCase()]);
-  return res.value;
-}
-
-async function set_pending(entry: PendingEntry): Promise<void> {
-  await kv.set(["pending", entry.hwid.toUpperCase()], entry);
-}
-
-async function delete_pending(hwid: string): Promise<void> {
-  await kv.delete(["pending", hwid.toUpperCase()]);
-}
-
-async function list_pending(): Promise<PendingEntry[]> {
-  const entries = [];
-  for await (const entry of kv.list<PendingEntry>({ prefix: ["pending"] })) {
-    entries.push(entry.value);
-  }
-  return entries;
-}
-
-async function list_approved(): Promise<AuthEntry[]> {
-  const entries = [];
-  for await (const entry of kv.list<AuthEntry>({ prefix: ["approved"] })) {
-    entries.push(entry.value);
-  }
-  return entries;
-}
-
-// ============ 响应工具 ============
-
-function json_response(obj: unknown, status = 200): Response {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    },
-  });
-}
-
-function cors_preflight(): Response {
-  return new Response(null, {
-    status: 204,
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    },
-  });
-}
-
-// 管理员权限校验中间件
-function require_admin(req: Request): boolean {
+// ============ 认证中间件 ============
+function check_admin_auth(req: Request): boolean {
   const auth = req.headers.get("Authorization");
+  if (!auth) return false;
   return auth === `Bearer ${ADMIN_KEY}`;
 }
 
-// ============ 主服务 ============
-
-console.log(`[F210 Auth] Server started`);
-console.log(`[F210 Auth] Config hash allowlist: ${CONFIG_HASH_ALLOWLIST.size} entries`);
-console.log(`[F210 Auth] DLL CRC allowlist: ${DLL_CRC_ALLOWLIST.size} entries`);
-console.log(`[F210 Auth] Admin key configured: ${!!Deno.env.get("ADMIN_KEY")}`);
-
-Deno.serve(async (req: Request) => {
+// ============ 路由 ============
+async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
+  const path = url.pathname;
   const method = req.method;
 
-  if (method === "OPTIONS") return cors_preflight();
+  if (method === "OPTIONS") {
+    return new Response(null, { headers: cors_headers() });
+  }
 
-  // ============ POST /license/check ============
-  if (url.pathname === "/license/check" && method === "POST") {
-    let body: any = {};
-    try { body = await req.json(); } 
-    catch { return json_response({ error: "invalid json" }, 400); }
+  // ============ /license/check ============
+  if (path === "/license/check" && method === "POST") {
+    try {
+      const body = await req.json();
+      const fp = body.fp || body.hwid || "";
+      const hwid = body.hwid || fp;
+      const board = body.board || "";
+      const cpu = body.cpu || "";
+      const config_hash = (body.config_hash || "").toUpperCase();
+      const dll_crc = (body.dll_crc || "").toUpperCase();
+      const version = body.version || "";
+      const client_ip = req.headers.get("x-forwarded-for") || req.headers.get("x-real-ip") || null;
 
-    const fp = String(body?.fp ?? "").trim().toUpperCase();
-    const hwid = String(body?.hwid ?? "").trim().toUpperCase();
-    const config_hash = String(body?.config_hash ?? "").trim().toUpperCase();
-    const dll_crc = String(body?.dll_crc ?? "").trim().toUpperCase();
-    const version = String(body?.version ?? "").trim();
-
-    if (!fp || !hwid) {
-      return json_response({ error: "missing fp/hwid", status: "rejected" }, 400);
-    }
-
-    // 1. 检查是否在已审批白名单
-    const approved = await get_approved(hwid);
-    if (approved) {
-      // 严格模式：检查 DLL CRC 是否被篡改
-      if (dll_crc && DLL_CRC_ALLOWLIST.size > 0 && !DLL_CRC_ALLOWLIST.has(dll_crc)) {
-        console.log(`[DENY] HWID ${hwid} DLL CRC mismatch: ${dll_crc}`);
-        return json_response({ status: "rejected", reason: "dll_tampered" }, 403);
-      }
-      
-      // 检查过期
-      if (approved.expires_at && Date.now() > approved.expires_at) {
-        await delete_approved(hwid);
-        console.log(`[DENY] HWID ${hwid} expired`);
-        return json_response({ status: "rejected", reason: "expired" }, 403);
+      if (!fp) {
+        return new Response(JSON.stringify({ error: "missing fp/hwid" }), {
+          status: 400, headers: cors_headers()
+        });
       }
 
-      console.log(`[AUTH] HWID ${hwid} authorized via Whitelist`);
-      return json_response({
-        status: "ok",
-        authorized: true,
-        auth_method: "whitelist",
-        fp,
-        hwid,
-        version: version || null,
-        server_time: Date.now(),
+      // 分开校验
+      // config_hash：白名单为空 → 跳过
+      const config_hash_valid = VALID_CONFIG_HASHES.length === 0 || !config_hash || VALID_CONFIG_HASHES.includes(config_hash);
+      // dll_crc：白名单为空 → 跳过；非空 → 严格校验
+      const dll_crc_valid = VALID_DLL_CRCS.length === 0 || !dll_crc || VALID_DLL_CRCS.includes(dll_crc);
+
+      const key = ["device", fp];
+      let device_entry = await KV.get<DeviceRecord>(key);
+      let device = device_entry.value;
+
+      if (!device) {
+        device = create_empty_device(fp, hwid);
+        device.device_code = gen_device_code();
+        device.status = "pending";
+        device.board = board;
+        device.cpu = cpu;
+        device.config_hash = config_hash;
+        device.dll_crc = dll_crc;
+        device.current_version = version;
+        device.last_ip = client_ip;
+        device.total_requests = 1;
+        device.config_hash_valid = config_hash_valid;
+        device.dll_crc_valid = dll_crc_valid;
+
+        // DLL CRC 不合法 → 标记（即使白名单为空也不触发这里）
+        if (!dll_crc_valid) {
+          device.note = `Invalid DLL CRC: ${dll_crc} at ${now_str()}`;
+        }
+
+        await KV.set(key, device);
+
+        return new Response(JSON.stringify({
+          status: "pending",
+          device_code: device.device_code,
+          message: "Device registered, awaiting approval"
+        }), { status: 202, headers: cors_headers() });
+      }
+
+      // 已有设备
+      const now = now_str();
+      device.last_seen_at = now;
+      device.last_request = now;
+      device.total_requests = (device.total_requests || 0) + 1;
+      if (client_ip) device.last_ip = client_ip;
+
+      if (!device.board && board) device.board = board;
+      if (!device.cpu && cpu) device.cpu = cpu;
+      if (!device.config_hash && config_hash) device.config_hash = config_hash;
+      if (!device.dll_crc && dll_crc) device.dll_crc = dll_crc;
+      if (version) device.current_version = version;
+
+      device.config_hash_valid = config_hash_valid;
+      device.dll_crc_valid = dll_crc_valid;
+
+      // DLL CRC 异常追踪
+      if (!dll_crc_valid) {
+        const old_note = device.note ? device.note + " | " : "";
+        device.note = old_note + `Invalid DLL CRC: ${dll_crc} at ${now}`;
+      }
+
+      // HWID 变化检测
+      if (hwid && hwid !== device.hwid) {
+        if (!device.hwid_history.includes(hwid)) {
+          device.hwid_history.push(hwid);
+        }
+        if (device.hwid_history.length > device.max_transfers + 1) {
+          device.status = "pending";
+        }
+      }
+
+      if (device.status === "active") {
+        await KV.set(key, device);
+        return new Response(JSON.stringify({
+          status: "ok", authorized: true, device_code: device.device_code, message: "Device authorized"
+        }), { headers: cors_headers() });
+
+      } else if (device.status === "pending" || device.status === "initializing") {
+        await KV.set(key, device);
+        return new Response(JSON.stringify({
+          status: "pending", device_code: device.device_code, message: "Device registered, awaiting approval"
+        }), { status: 202, headers: cors_headers() });
+
+      } else if (device.status === "revoked" || device.status === "banned") {
+        await KV.set(key, device);
+        return new Response(JSON.stringify({
+          status: "rejected", device_code: device.device_code, message: `Device ${device.status}`
+        }), { status: 403, headers: cors_headers() });
+
+      } else {
+        await KV.set(key, device);
+        return new Response(JSON.stringify({
+          status: "pending", device_code: device.device_code, message: "Unknown status, awaiting review"
+        }), { status: 202, headers: cors_headers() });
+      }
+
+    } catch (e) {
+      return new Response(JSON.stringify({ error: "invalid request", detail: String(e) }), {
+        status: 400, headers: cors_headers()
       });
     }
-
-    // 2. 检查 Config Hash 辅助放行（免审批信任）
-    if (config_hash && CONFIG_HASH_ALLOWLIST.has(config_hash)) {
-      console.log(`[AUTH] HWID ${hwid} authorized via Config Hash fallback`);
-      return json_response({
-        status: "ok",
-        authorized: true,
-        auth_method: "config_hash",
-        fp,
-        hwid,
-        server_time: Date.now(),
-      });
-    }
-
-    // 3. 未授权：记入 Pending 表等待审批
-    const existing_pending = await get_pending(hwid);
-    const pending_entry: PendingEntry = {
-      hwid,
-      fp,
-      config_hash,
-      dll_crc,
-      version,
-      device_code: String(body?.device_code ?? ""),
-      first_seen_at: existing_pending?.first_seen_at ?? Date.now(),
-      last_seen_at: Date.now(),
-      request_count: (existing_pending?.request_count ?? 0) + 1,
-    };
-    await set_pending(pending_entry);
-
-    console.log(`[PENDING] New/Updated pending device HWID=${hwid} config_hash=${config_hash}`);
-    return json_response({
-      status: "pending",
-      authorized: false,
-      reason: "awaiting_admin_approval",
-      hwid,
-    }, 202); // 202 Accepted
   }
 
-  // ============ 管理员接口（需 ADMIN_KEY） ============
-  if (url.pathname.startsWith("/admin/")) {
-    if (!require_admin(req)) {
-      return json_response({ error: "unauthorized" }, 401);
+  // ============ /admin/approve ============
+  if (path === "/admin/approve" && method === "POST") {
+    if (!check_admin_auth(req)) {
+      return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: cors_headers() });
     }
-
-    // GET /admin/pending
-    if (url.pathname === "/admin/pending" && method === "GET") {
-      const list = await list_pending();
-      return json_response({ count: list.length, pending: list });
-    }
-
-    // POST /admin/approve
-    if (url.pathname === "/admin/approve" && method === "POST") {
+    try {
       const body = await req.json();
-      const hwid = String(body?.hwid ?? "").trim().toUpperCase();
-      if (!hwid) return json_response({ error: "missing hwid" }, 400);
+      const fp = body.fp;
+      if (!fp) return new Response(JSON.stringify({ error: "missing fp" }), { status: 400, headers: cors_headers() });
 
-      const expires_in_days = Number(body?.expires_in_days ?? 0);
-      const expires_at = expires_in_days > 0 ? Date.now() + expires_in_days * 24 * 60 * 60 * 1000 : undefined;
+      const key = ["device", fp];
+      const entry = await KV.get<DeviceRecord>(key);
+      if (!entry.value) return new Response(JSON.stringify({ error: "device not found" }), { status: 404, headers: cors_headers() });
 
-      const pending = await get_pending(hwid);
-      
-      const entry: AuthEntry = {
-        hwid,
-        expires_at,
-        note: String(body?.note ?? pending?.fp ?? "manual_approve"),
-        approved_at: Date.now(),
-        version: pending?.version,
-        device_code: pending?.device_code,
-        dll_crc: pending?.dll_crc,
-      };
+      const device = entry.value;
+      device.status = "active";
+      device.activated_at = now_str();
+      if (body.note) device.note = body.note;
+      if (body.allowed_versions?.length > 0) device.allowed_versions = body.allowed_versions;
+      if (body.expires_at) device.expires_at = body.expires_at;
 
-      await set_approved(entry);
-      await delete_pending(hwid); // 从待审移出
-
-      console.log(`[ADMIN] Approved HWID ${hwid}`);
-      return json_response({ success: true, action: "approved", entry });
+      await KV.set(key, device);
+      return new Response(JSON.stringify({ success: true, fp: device.fp, device_code: device.device_code, status: device.status, message: "Device approved" }), { headers: cors_headers() });
+    } catch (e) {
+      return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: cors_headers() });
     }
+  }
 
-    // POST /admin/revoke
-    if (url.pathname === "/admin/revoke" && method === "POST") {
+  // ============ /admin/revoke ============
+  if (path === "/admin/revoke" && method === "POST") {
+    if (!check_admin_auth(req)) {
+      return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: cors_headers() });
+    }
+    try {
       const body = await req.json();
-      const hwid = String(body?.hwid ?? "").trim().toUpperCase();
-      if (!hwid) return json_response({ error: "missing hwid" }, 400);
-      
-      await delete_approved(hwid);
-      await delete_pending(hwid);
-      
-      console.log(`[ADMIN] Revoked HWID ${hwid}`);
-      return json_response({ success: true, action: "revoked", hwid });
-    }
-    
-    // GET /admin/list
-    if (url.pathname === "/admin/list" && method === "GET") {
-      const list = await list_approved();
-      return json_response({ count: list.length, approved: list });
+      const fp = body.fp;
+      if (!fp) return new Response(JSON.stringify({ error: "missing fp" }), { status: 400, headers: cors_headers() });
+
+      const key = ["device", fp];
+      const entry = await KV.get<DeviceRecord>(key);
+      if (!entry.value) return new Response(JSON.stringify({ error: "device not found" }), { status: 404, headers: cors_headers() });
+
+      const device = entry.value;
+      device.status = "revoked";
+      if (body.reason) device.note = `Revoked: ${body.reason}`;
+      device.last_request = now_str();
+
+      await KV.set(key, device);
+      return new Response(JSON.stringify({ success: true, fp: device.fp, status: device.status, message: "Device revoked" }), { headers: cors_headers() });
+    } catch (e) {
+      return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: cors_headers() });
     }
   }
 
-  // ============ GET /health ============
-  if (url.pathname === "/health" && method === "GET") {
-    return json_response({
-      status: "healthy",
-      version: "2.1.0",
-      admin_key_configured: !!Deno.env.get("ADMIN_KEY"),
-      approved_count: (await list_approved()).length,
-      pending_count: (await list_pending()).length,
-    });
+  // ============ /admin/delete-device ============
+  if (path === "/admin/delete-device" && method === "POST") {
+    if (!check_admin_auth(req)) {
+      return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: cors_headers() });
+    }
+    try {
+      const body = await req.json();
+      const fp = body.fp;
+      if (!fp) return new Response(JSON.stringify({ error: "missing fp" }), { status: 400, headers: cors_headers() });
+
+      const key = ["device", fp];
+      await KV.delete(key);
+      return new Response(JSON.stringify({ success: true, fp, message: "Device deleted" }), { headers: cors_headers() });
+    } catch (e) {
+      return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: cors_headers() });
+    }
   }
 
-  return json_response({ error: "not found", path: url.pathname }, 404);
-});
+  // ============ /admin/devices ============
+  if (path === "/admin/devices" && method === "GET") {
+    if (!check_admin_auth(req)) {
+      return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: cors_headers() });
+    }
+    const devices: any[] = [];
+    const limit = parseInt(url.searchParams.get("limit") || "50");
+    const status_filter = url.searchParams.get("status");
+
+    for await (const entry of KV.list<DeviceRecord>({ prefix: ["device"] })) {
+      if (entry.value) {
+        if (status_filter && entry.value.status !== status_filter) continue;
+        devices.push(entry.value);
+        if (devices.length >= limit) break;
+      }
+    }
+    return new Response(JSON.stringify({ count: devices.length, devices }, null, 2), { headers: cors_headers() });
+  }
+
+  // ============ /admin/schema ============
+  if (path === "/admin/schema" && method === "GET") {
+    if (!check_admin_auth(req)) {
+      return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: cors_headers() });
+    }
+    const sample = create_empty_device("SAMPLE", "SAMPLE");
+    return new Response(JSON.stringify({
+      version: "2.3.3",
+      description: "F210 Device Record Schema",
+      fields: Object.keys(sample).map(k => ({ field: k, type: typeof (sample as any)[k], sample: (sample as any)[k] }))
+    }, null, 2), { headers: cors_headers() });
+  }
+
+  // ============ /health ============
+  if (path === "/health" && method === "GET") {
+    return new Response(JSON.stringify({ status: "ok", version: "2.3.3", time: now_str() }), { headers: cors_headers() });
+  }
+
+  return new Response(JSON.stringify({ error: "not found", path }), { status: 404, headers: cors_headers() });
+}
+
+console.log(`F210 Auth Server v2.3.3 starting...`);
+Deno.serve({ port: 8000 }, handler);
