@@ -121,6 +121,9 @@ async function handler(req: Request): Promise<Response> {
                 });
             }
 
+	    // 👇【推荐】在这里插入请求接收日志
+ 	    console.log(`[AUTH REQ] IP: ${client_ip}, FP: ${fp}, HWID: ${hwid}, CPU_FP: ${cpu_fp}, BOARD_FP: ${board_fp}, Config: ${config_hash}, DLL: ${dll_crc}, Version: ${version}`);
+
             // ★ P1: nonce 防重放（5分钟 TTL）
             if (nonce) {
                 const nonce_key = ["nonce", nonce];
