@@ -7,7 +7,7 @@ const KV = await Deno.openKv();
 
 const VALID_CONFIG_HASHES: string[] = [];
 const VALID_DLL_CRCS: string[] = [
-    "167DC4B9"  // ← 填你新编译的 DLL CRC32
+    "4BE98873"  // ← 填你新编译的 DLL CRC32
 ];
 
 function now_str(): string {
