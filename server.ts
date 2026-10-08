@@ -7,7 +7,7 @@ const KV = await Deno.openKv();
 
 const VALID_CONFIG_HASHES: string[] = [];
 const VALID_DLL_CRCS: string[] = [
-    "4BE98873"  // ← 填你新编译的 DLL CRC32
+    "AF8CFD46"  // ← 填你新编译的 DLL CRC32
 ];
 
 function now_str(): string {
@@ -121,7 +121,7 @@ async function handler(req: Request): Promise<Response> {
                 });
             }
 
-	    // 👇【推荐】在这里插入请求接收日志
+	    // 【推荐】在这里插入请求接收日志
  	    console.log(`[AUTH REQ] IP: ${client_ip}, FP: ${fp}, HWID: ${hwid}, CPU_FP: ${cpu_fp}, BOARD_FP: ${board_fp}, Config: ${config_hash}, DLL: ${dll_crc}, Version: ${version}`);
 
             // ★ P1: nonce 防重放（5分钟 TTL）
@@ -142,6 +142,38 @@ async function handler(req: Request): Promise<Response> {
             const key = ["device", fp];
             let device_entry = await KV.get<DeviceRecord>(key);
             let device = device_entry.value;
+
+// ... 前面的 nonce 防重放逻辑保持不变 ...
+
+  const config_hash_valid = VALID_CONFIG_HASHES.length === 0 || !config_hash || VALID_CONFIG_HASHES.includes(config_hash);
+  const dll_crc_valid = VALID_DLL_CRCS.length === 0 || !dll_crc || VALID_DLL_CRCS.includes(dll_crc);
+
+  let key = ["device", fp];
+  let device_entry = await KV.get<DeviceRecord>(key);
+  let device = device_entry.value;
+
+  // 👇【Step 2 正确插入位置】在查到 device 记录后，对比指纹
+  if (device && device.status === "active") {
+    const oldCpuFp = device.cpu_fp || "";
+    const oldBoardFp = device.board_fp || "";
+    
+    // 如果客户端传了新指纹，且与数据库旧指纹不一致
+    if ((cpu_fp && oldCpuFp && cpu_fp !== oldCpuFp) || 
+        (board_fp && oldBoardFp && board_fp !== oldBoardFp)) {
+      
+      console.log(`[HW CHANGED] Device ${fp}: CPU ${oldCpuFp}->${cpu_fp}, Board ${oldBoardFp}->${board_fp}`);
+      
+      // 可选：更新数据库里的新指纹，方便管理员审核后直接通过
+      // await KV.set(key, { ...device, cpu_fp, board_fp, last_changed: now_str() });
+
+      return new Response(JSON.stringify({
+        status: "hardware_changed", 
+        message: "Hardware fingerprint changed. Contact admin."
+      }), { headers: cors_headers() }); // 状态码用 200 即可，靠 status 字段区分
+    }
+  }
+
+  // ... 后面的 status: "pending" / "active" 逻辑保持不变 ...
 
             if (!device) {
                 device = create_empty_device(fp, hwid);
