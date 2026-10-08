@@ -152,24 +152,17 @@ async function handler(req: Request): Promise<Response> {
   let device_entry = await KV.get<DeviceRecord>(key);
   let device = device_entry.value;
 
-  // 👇【Step 2 正确插入位置】在查到 device 记录后，对比指纹
+    // ↓↓↓ 只加下面这一段，上面那些 let 一个都不要再加 ↓↓↓
   if (device && device.status === "active") {
     const oldCpuFp = device.cpu_fp || "";
     const oldBoardFp = device.board_fp || "";
-    
-    // 如果客户端传了新指纹，且与数据库旧指纹不一致
     if ((cpu_fp && oldCpuFp && cpu_fp !== oldCpuFp) || 
         (board_fp && oldBoardFp && board_fp !== oldBoardFp)) {
-      
       console.log(`[HW CHANGED] Device ${fp}: CPU ${oldCpuFp}->${cpu_fp}, Board ${oldBoardFp}->${board_fp}`);
-      
-      // 可选：更新数据库里的新指纹，方便管理员审核后直接通过
-      // await KV.set(key, { ...device, cpu_fp, board_fp, last_changed: now_str() });
-
       return new Response(JSON.stringify({
-        status: "hardware_changed", 
+        status: "hardware_changed",
         message: "Hardware fingerprint changed. Contact admin."
-      }), { headers: cors_headers() }); // 状态码用 200 即可，靠 status 字段区分
+      }), { headers: cors_headers() });
     }
   }
 
