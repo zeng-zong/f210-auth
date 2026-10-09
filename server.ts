@@ -519,7 +519,7 @@ return new Response(JSON.stringify({ error: "not found", path }), { status: 404,
 
 console.log(`F210 Auth Server v2.6.0 starting...`);
 
-/ ============ Deno.cron: 每天北京时间 08:00 自动过期检查 ============
+// ============ Deno.cron: 每天北京时间 08:00 自动过期检查 ============
 // 必须在模块顶层声明（Deno.serve 之前），平台才会在部署时注册
 Deno.cron(
   "expire-devices-daily",           // Cron 面板显示的名字
