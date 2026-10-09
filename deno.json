@@ -5,12 +5,6 @@
   "tasks": {
     "start": "deno run --allow-net --allow-env --unstable-kv server.ts"
   },
-  "cron": [
-    {
-      "path": "/cron/expire-devices",
-      "schedule": "0 0 * * *"
-    }
-  ],
   "deploy": {
     "entrypoint": "./server.ts"
   }
