@@ -541,7 +541,6 @@ return new Response(JSON.stringify({ status: "ok", version: "2.6.0", time: now_s
 }
 
 return new Response(JSON.stringify({ error: "not found", path }), { status: 404, headers: cors_headers() });
-}
 
 console.log(`F210 Auth Server v2.6.0 starting...`);
 Deno.serve({ port: 8000 }, handler);
