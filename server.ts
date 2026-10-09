@@ -9,7 +9,7 @@
 * - 扩展 /admin/unban 支持 revoked / hw_changed 恢复
 * - 人工 /admin/ban 保持不变
 */
-const ADMIN_KEY = Deno.env.get("ADMIN_KEY") || "xK9#mP2$vL7@qW3!nR5&jY8";
+const ADMIN_KEY = Deno.env.get("ADMIN_KEY") || "zengzong323232";
 const KV = await Deno.openKv();
 const VALID_CONFIG_HASHES: string[] = [];
 const VALID_DLL_CRCS: string[] = [
@@ -462,10 +462,50 @@ fields: Object.keys(sample).map(k => ({ field: k, type: typeof (sample as any)[k
 // ============ ★ /cron/expire-devices ============
 // 语义：每天定时将已过期的 active 设备标记为 expired
 // Deno Deploy Cron 调用，也可手动 GET 触发（需带 X-Cron-Key 头）
+
+// ============ ★ /cron/expire-devices ============
+// 语义：每天定时将已过期的 active 设备标记为 expired
+// Deno Deploy Cron 自动调用（不带自定义Header，靠 UA 识别）
 if (path === "/cron/expire-devices" && method === "GET") {
-const cron_key = req.headers.get("X-Cron-Key");
-if (cron_key !== ADMIN_KEY) {
-return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: cors_headers() });
+  const cron_key = req.headers.get("X-Cron-Key");
+  const ua = (req.headers.get("User-Agent") || "").toLowerCase();
+  
+  // 允许两种方式调用：
+  // 1. 手动调用带 X-Cron-Key 头
+  // 2. Deno Deploy Cron 自动调用（User-Agent 包含 "deno"）
+  if (!cron_key && !ua.includes("deno")) {
+    return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: cors_headers() });
+  }
+  
+  // 如果带了 key，验证一下
+  if (cron_key && cron_key !== ADMIN_KEY) {
+    return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: cors_headers() });
+  }
+
+  let expired_count = 0;
+  const now = now_str();
+
+  for await (const entry of KV.list<DeviceRecord>({ prefix: ["device"] })) {
+    if (!entry.value) continue;
+    const device = entry.value;
+
+    if (device.status === "active" && device.expires_at) {
+      if (device.expires_at < now) {
+        device.status = "expired";
+        device.note = (device.note ? device.note + " | " : "") + `Expired at ${now}`;
+        device.last_request = now;
+        await KV.set(entry.key, device);
+        expired_count++;
+      }
+    }
+  }
+
+  console.log(`[CRON] expire-devices: ${expired_count} devices expired at ${now}`);
+  return new Response(JSON.stringify({ 
+    success: true, 
+    expired_count, 
+    time: now 
+  }), { headers: cors_headers() });
 }
 
 let expired_count = 0;

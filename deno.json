@@ -1,0 +1,13 @@
+{
+  "name": "f210-auth-server",
+  "version": "2.6.0",
+  "tasks": {
+    "start": "deno run --allow-net --allow-env --unstable-kv server.ts"
+  },
+  "cron": [
+    {
+      "path": "/cron/expire-devices",
+      "schedule": "0 0 * * *"
+    }
+  ]
+}
