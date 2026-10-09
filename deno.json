@@ -10,5 +10,8 @@
       "path": "/cron/expire-devices",
       "schedule": "0 0 * * *"
     }
-  ]
+  ],
+  "deploy": {
+    "entrypoint": "./server.ts"
+  }
 }
