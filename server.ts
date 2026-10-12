@@ -1,18 +1,16 @@
 /**
- * server.ts v2.7.0
- * F210 Auth Server - + X-Sign HMAC-SHA256 签名校验
- *
- * 变更日志:
- * - 新增 X-Sign 请求头 HMAC-SHA256 校验
- * - config_hash / dll_crc 白名单强制校验
- * - 签名失败返回 403 rejected
- */
-
+* server.ts v2.7.1
+* F210 Auth Server - + X-Sign HMAC-SHA256 签名校验
+*
+* 变更日志:
+* - v2.7.1: 修复 HMAC 密钥长度不一致（填充到32字节对齐 bridge 端）；DLL CRC 白名单改为小写
+* - v2.7.0: 新增 X-Sign 请求头 HMAC-SHA256 校验
+* - config_hash / dll_crc 白名单强制校验
+* - 签名失败返回 403 rejected
+*/
 const ADMIN_KEY = Deno.env.get("ADMIN_KEY") || "zengzong323232";
-
 // ★ 签名密钥：必须和 bridge 端硬编码的密钥一致！
 const SIGN_SECRET = Deno.env.get("SIGN_SECRET") || "f210_sign_key_2026";
-
 const KV = await Deno.openKv();
 
 // ★ 填入你允许的 config_hash 白名单（bridge 端算出的 HMAC 值）
@@ -20,9 +18,9 @@ const VALID_CONFIG_HASHES: string[] = [
   "e70aaff7ac6f57c7532fa6e383636a14eb5ae27b0e5e872b9171d68752ad1916",
 ];
 
-// ★ 填入你允许的 DLL SHA256 白名单
+// ★ 填入你允许的 DLL SHA256 白名单（全小写，和 server 端 .toLowerCase() 对齐）
 const VALID_DLL_CRCS: string[] = [
-  "DA0F2724D5738580CFEA71EBC740F6BD4FE275306033EBD103F66176677AE2F0",
+  "da0f2724d5738580cfea71ebc740f6bd4fe275306033ebd103f66176677ae2f0",
   // 之前测试用的旧值: "11fb8c15e3a3452b007f677e8b73b6c3459b5d501a21033ff209ec768479cde6",
 ];
 
@@ -36,13 +34,23 @@ async function verify_x_sign(
   timestamp: string,
   client_sign: string
 ): Promise<boolean> {
-  // ★ 如果 bridge 端拼接格式不同，改这里
+  // ★ 拼接格式和 bridge 端完全一致
   const message = `${hwid}|${cpu_fp}|${board_fp}|${config_hash}|${dll_crc}|${timestamp}`;
-
   const encoder = new TextEncoder();
+
+  // ★ 密钥填充到 32 字节（和 bridge 端 BYTE sign_key[32] 循环逻辑对齐）
+  let keyBytes = encoder.encode(SIGN_SECRET);
+  if (keyBytes.length < 32) {
+    const padded = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) {
+      padded[i] = keyBytes[i % keyBytes.length];
+    }
+    keyBytes = padded;
+  }
+
   const key = await crypto.subtle.importKey(
     "raw",
-    encoder.encode(SIGN_SECRET),
+    keyBytes,
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"]
@@ -188,6 +196,7 @@ async function handler(req: Request): Promise<Response> {
       const sign_valid = await verify_x_sign(
         hwid, cpu_fp, board_fp, config_hash, dll_crc, timestamp, x_sign
       );
+
       if (!sign_valid) {
         console.log(`[AUTH REJECT] Invalid X-Sign: FP=${fp}, HWID=${hwid}, ClientSign=${x_sign}`);
         return new Response(JSON.stringify({
@@ -209,7 +218,7 @@ async function handler(req: Request): Promise<Response> {
         await KV.set(nonce_key, { fp, time: now_str() }, { expireIn: 300 });
       }
 
-      // ★ 白名单校验（现在强制校验，不再放行空列表）
+      // ★ 白名单校验
       const config_hash_valid = VALID_CONFIG_HASHES.length === 0 || VALID_CONFIG_HASHES.includes(config_hash);
       const dll_crc_valid = VALID_DLL_CRCS.length === 0 || VALID_DLL_CRCS.includes(dll_crc);
 
@@ -253,7 +262,7 @@ async function handler(req: Request): Promise<Response> {
         }), { status: 202, headers: cors_headers() });
       }
 
-      // 已有设备 — 更新字段（和 v2.6.0 逻辑一致）
+      // 已有设备 — 更新字段
       const now = now_str();
       device.last_seen_at = now;
       device.last_request = now;
@@ -287,7 +296,6 @@ async function handler(req: Request): Promise<Response> {
           if (board_fp) device.board_fp = board_fp;
           if (cpu) device.cpu = cpu;
           if (board) device.board = board;
-
           const resetDate = new Date(device.hw_change_reset_at || now);
           const daysSinceReset = (Date.now() - resetDate.getTime()) / (1000 * 60 * 60 * 24);
           if (daysSinceReset > 30) {
@@ -316,7 +324,6 @@ async function handler(req: Request): Promise<Response> {
 
       if (!device.cpu_fp && cpu_fp) device.cpu_fp = cpu_fp;
       if (!device.board_fp && board_fp) device.board_fp = board_fp;
-
       if (hwid && hwid !== device.hwid) {
         if (!device.hwid_history.includes(hwid)) {
           device.hwid_history.push(hwid);
@@ -326,7 +333,7 @@ async function handler(req: Request): Promise<Response> {
         }
       }
 
-      // 状态返回（和 v2.6.0 一致）
+      // 状态返回
       if (device.status === "active") {
         await KV.set(key, device);
         return new Response(JSON.stringify({
@@ -353,7 +360,6 @@ async function handler(req: Request): Promise<Response> {
           status: "pending", device_code: device.device_code, message: "Unknown status, awaiting review"
         }), { status: 202, headers: cors_headers() });
       }
-
     } catch (e) {
       return new Response(JSON.stringify({ error: "invalid request", detail: String(e) }), {
         status: 400, headers: cors_headers()
@@ -502,7 +508,7 @@ async function handler(req: Request): Promise<Response> {
     }
     const sample = create_empty_device("SAMPLE", "SAMPLE");
     return new Response(JSON.stringify({
-      version: "2.7.0",
+      version: "2.7.1",
       description: "F210 Device Record Schema",
       fields: Object.keys(sample).map(k => ({ field: k, type: typeof (sample as any)[k], sample: (sample as any)[k] }))
     }, null, 2), { headers: cors_headers() });
@@ -539,13 +545,13 @@ async function handler(req: Request): Promise<Response> {
 
   // ============ /health ============
   if (path === "/health" && method === "GET") {
-    return new Response(JSON.stringify({ status: "ok", version: "2.7.0", time: now_str() }), { headers: cors_headers() });
+    return new Response(JSON.stringify({ status: "ok", version: "2.7.1", time: now_str() }), { headers: cors_headers() });
   }
 
   return new Response(JSON.stringify({ error: "not found", path }), { status: 404, headers: cors_headers() });
 }
 
-console.log(`F210 Auth Server v2.7.0 starting...`);
+console.log(`F210 Auth Server v2.7.1 starting...`);
 
 Deno.cron(
   "expire-devices-daily",
