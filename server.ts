@@ -20,7 +20,7 @@ const VALID_CONFIG_HASHES: string[] = [
 
 // ★ 填入你允许的 DLL SHA256 白名单（全小写，和 server 端 .toLowerCase() 对齐）
 const VALID_DLL_CRCS: string[] = [
-  "94c6a78920b136addf13a09e93fa6c1e3c171fc06b418b832851689a3bb30877",
+  "bc5693b07ae592bd46c42d01c389e29162a988a2ec714bd6daa3966d5202546d",
   // 之前测试用的旧值: "11fb8c15e3a3452b007f677e8b73b6c3459b5d501a21033ff209ec768479cde6",
 ];
 
