@@ -15,12 +15,12 @@ const KV = await Deno.openKv();
 
 // ★ 填入你允许的 config_hash 白名单（bridge 端算出的 HMAC 值）
 const VALID_CONFIG_HASHES: string[] = [
-  "98abc6fa51cae04e02a829a9deb90a0ca8d91e0e586fba336442363aae17fe19",
+  "46395177cda1ea54ed713fd239b5f8f936adf1bf6e306bf35d71cb542ea375ef",
 ];
 
 // ★ 填入你允许的 DLL SHA256 白名单（全小写，和 server 端 .toLowerCase() 对齐）
 const VALID_DLL_CRCS: string[] = [
-  "066f91efc3eb5dd4e9405fd7a5d41fd8ab317bc4cbf1bb293a50b265684aaacb",
+  "ea221eda0cd9b92e56c4f836e1f3580982519a3755a33edbd73f511c8991e82e",
   // 之前测试用的旧值: "11fb8c15e3a3452b007f677e8b73b6c3459b5d501a21033ff209ec768479cde6",
 ];
 
