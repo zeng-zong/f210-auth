@@ -69,14 +69,13 @@ let keyBytes = SIGN_KEY_BYTES;
     ["sign"]
   );
   const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(message));
-	
-	// 测试debug，上线删除
-	console.log(`[DEBUG] Server calculated sign: ${sig_hex}`); 		// ★ 注意变量名要加下划线
-	console.log(`[DEBUG] Client sent sign:      ${client_sign}`); 		// ★ 新增这行
-
   const sig_hex = Array.from(new Uint8Array(sig))
     .map(b => b.toString(16).padStart(2, "0"))
     .join("");
+
+	// 测试debug，上线删除
+	console.log(`[DEBUG] Server calculated sign: ${sig_hex}`); 		// ★ 注意变量名要加下划线
+	console.log(`[DEBUG] Client sent sign:      ${client_sign}`); 		// ★ 新增这行
 
   // timing-safe 比较
   if (sig_hex.length !== client_sign.length) return false;
