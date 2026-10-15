@@ -27,7 +27,7 @@ const VALID_CONFIG_HASHES: string[] = [
 
 // ★ 填入你允许的 DLL SHA256 白名单（全小写，和 server 端 .toLowerCase() 对齐）
 const VALID_DLL_CRCS: string[] = [
-  "29d1e27f138a5e18ad68d0f082ff22f4f5afb971bd8a7df989819ed9ce983958",
+  "a702fffd4112bb95d8fdff57470bbdabfb824b0a36bacf6940dbed26f8d16eb3",
   // 之前测试用的旧值: "11fb8c15e3a3452b007f677e8b73b6c3459b5d501a21033ff209ec768479cde6",
 ];
 
@@ -71,8 +71,8 @@ let keyBytes = SIGN_KEY_BYTES;
   const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(message));
 	
 	// 测试debug，上线删除
-	console.log(`[DEBUG] Server calculated sign: ${sigHex}`); // ★ 新增这行
-	console.log(`[DEBUG] Client sent sign:      ${client_sign}`); // ★ 新增这行
+	console.log(`[DEBUG] Server calculated sign: ${sig_hex}`); 		// ★ 注意变量名要加下划线
+	console.log(`[DEBUG] Client sent sign:      ${client_sign}`); 		// ★ 新增这行
 
   const sig_hex = Array.from(new Uint8Array(sig))
     .map(b => b.toString(16).padStart(2, "0"))
@@ -84,6 +84,12 @@ let keyBytes = SIGN_KEY_BYTES;
   for (let i = 0; i < sig_hex.length; i++) {
     diff |= sig_hex.charCodeAt(i) ^ client_sign.charCodeAt(i);
   }
+
+    // ★ 临时调试：打印签名对比，测试debug，上线删除
+    console.log(`[DEBUG] Server sign: ${sig_hex}`);
+    console.log(`[DEBUG] Client sign: ${client_sign}`);
+    console.log(`[DEBUG] Match: ${diff === 0}`);
+
   return diff === 0;
 }
 
