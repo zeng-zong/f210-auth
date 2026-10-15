@@ -8,6 +8,7 @@
 * - config_hash / dll_crc 白名单强制校验
 * - 签名失败返回 403 rejected
 */
+
 const ADMIN_KEY = Deno.env.get("ADMIN_KEY") || "zengzong323232";
 // ★ 签名密钥：必须和 bridge 端硬编码的密钥一致！
 // 改密文证书签名，要删除明文
@@ -41,6 +42,7 @@ async function verify_x_sign(
   timestamp: string,
   client_sign: string
 ): Promise<boolean> {
+
   // ★ 拼接格式和 bridge 端完全一致
   const message = `${hwid}|${cpu_fp}|${board_fp}|${config_hash}|${dll_crc}|${timestamp}`;
 	// 测试debug，上线删除
