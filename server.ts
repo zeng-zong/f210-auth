@@ -10,9 +10,16 @@
 */
 const ADMIN_KEY = Deno.env.get("ADMIN_KEY") || "zengzong323232";
 // ★ 签名密钥：必须和 bridge 端硬编码的密钥一致！
-const SIGN_SECRET = Deno.env.get("SIGN_SECRET") || "f210_sign_key_2026";
-const KV = await Deno.openKv();
+// 改密文证书签名，要删除明文
+// const SIGN_SECRET = Deno.env.get("SIGN_SECRET") || "f210_sign_key_2026";
 
+// ★ HMAC 密钥（和 bridge 端 _obf_get_hmac_seed() + 0x9E 派生结果一致，24字节）
+const SIGN_KEY_HEX = "24006d0e8e07d543f62cb777451b2a9ef26c3442d1ab11a5";
+const SIGN_KEY_BYTES = new Uint8Array(
+    SIGN_KEY_HEX.match(/.{2}/g)!.map(b => parseInt(b, 16))
+);
+
+const KV = await Deno.openKv();
 // ★ 填入你允许的 config_hash 白名单（bridge 端算出的 HMAC 值）
 const VALID_CONFIG_HASHES: string[] = [
   "46395177cda1ea54ed713fd239b5f8f936adf1bf6e306bf35d71cb542ea375ef",
@@ -20,7 +27,7 @@ const VALID_CONFIG_HASHES: string[] = [
 
 // ★ 填入你允许的 DLL SHA256 白名单（全小写，和 server 端 .toLowerCase() 对齐）
 const VALID_DLL_CRCS: string[] = [
-  "ea221eda0cd9b92e56c4f836e1f3580982519a3755a33edbd73f511c8991e82e",
+  "29d1e27f138a5e18ad68d0f082ff22f4f5afb971bd8a7df989819ed9ce983958",
   // 之前测试用的旧值: "11fb8c15e3a3452b007f677e8b73b6c3459b5d501a21033ff209ec768479cde6",
 ];
 
@@ -36,17 +43,23 @@ async function verify_x_sign(
 ): Promise<boolean> {
   // ★ 拼接格式和 bridge 端完全一致
   const message = `${hwid}|${cpu_fp}|${board_fp}|${config_hash}|${dll_crc}|${timestamp}`;
+	// 测试debug，上线删除
+	console.log(`[DEBUG] Server message: ${message}`); // ★ 新增这行
   const encoder = new TextEncoder();
 
+	// 旧版密钥处理删除
   // ★ 密钥填充到 32 字节（和 bridge 端 BYTE sign_key[32] 循环逻辑对齐）
-  let keyBytes = encoder.encode(SIGN_SECRET);
-  if (keyBytes.length < 32) {
-    const padded = new Uint8Array(32);
-    for (let i = 0; i < 32; i++) {
-      padded[i] = keyBytes[i % keyBytes.length];
-    }
-    keyBytes = padded;
-  }
+  // let keyBytes = encoder.encode(SIGN_SECRET);
+  // if (keyBytes.length < 32) {
+  //    const padded = new Uint8Array(32);
+  //   for (let i = 0; i < 32; i++) {
+  //     padded[i] = keyBytes[i % keyBytes.length];
+  //   }
+  //   keyBytes = padded;
+  //   }
+
+// ★ 直接使用客户端派生密钥（24字节，无需 pad）
+let keyBytes = SIGN_KEY_BYTES;
 
   const key = await crypto.subtle.importKey(
     "raw",
@@ -56,6 +69,11 @@ async function verify_x_sign(
     ["sign"]
   );
   const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(message));
+	
+	// 测试debug，上线删除
+	console.log(`[DEBUG] Server calculated sign: ${sigHex}`); // ★ 新增这行
+	console.log(`[DEBUG] Client sent sign:      ${client_sign}`); // ★ 新增这行
+
   const sig_hex = Array.from(new Uint8Array(sig))
     .map(b => b.toString(16).padStart(2, "0"))
     .join("");
@@ -176,7 +194,10 @@ async function handler(req: Request): Promise<Response> {
       const nonce = body.nonce || "";
       const cpu_fp = body.cpu_fp || "";
       const board_fp = body.board_fp || "";
-      const timestamp = body.timestamp || now_str();
+	// 不再用旧版的时间鉴别
+      // const timestamp = body.timestamp || now_str();
+	// 需要同步改为秒级时间戳
+	const timestamp = body.timestamp || String(Math.floor(Date.now() / 1000));
       const client_ip = req.headers.get("x-forwarded-for") || req.headers.get("x-real-ip") || null;
 
       if (!fp) {
@@ -205,6 +226,16 @@ async function handler(req: Request): Promise<Response> {
       }
 
       console.log(`[AUTH REQ] IP: ${client_ip}, FP: ${fp}, HWID: ${hwid}, CPU_FP: ${cpu_fp}, BOARD_FP: ${board_fp}, Config: ${config_hash}, DLL: ${dll_crc}, Version: ${version}`);
+
+    // ★ 新增：时间戳窗口校验（±5分钟）
+    const clientTs = parseInt(timestamp);
+    const serverTs = Math.floor(Date.now() / 1000);
+    if (isNaN(clientTs) || Math.abs(serverTs - clientTs) > 300) {
+        console.log(`[AUTH REJECT] Timestamp out of window: client=${clientTs}, server=${serverTs}`);
+        return new Response(JSON.stringify({
+            status: "rejected", message: "Timestamp out of window"
+        }), { status: 403, headers: cors_headers() });
+    }
 
       // ★ P1: nonce 防重放（5分钟 TTL）
       if (nonce) {
